@@ -1,0 +1,72 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python Debugger: Current File",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Train Mask R-CNN",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/train_maskrcnn_improved.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--data_root", "/rodata/dlmp_path/han/data/hovernet_dataset/hoverdata",
+                "--dinov2_checkpoint", "/rodata/dlmp_path/han/data/m328672/dinov2-main/dgx_vitg14_patch37M/training_287499/teacher_checkpoint.pth",
+                "--batch_size", "4",
+                "--num_epochs", "50",
+                "--lr", "5e-4",
+                "--use_amp",
+                "--augmentation_multiplier", "3",
+                "--output_dir", "./outputs_maskrcnn_improved"
+            ],
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0"
+            },
+            "justMyCode": false
+        },
+        {
+            "name": "Train Mask R-CNN (Small - Debug)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/train_maskrcnn_improved.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--data_root", "/rodata/dlmp_path/han/data/hovernet_dataset/hoverdata",
+                "--dinov2_checkpoint", "/rodata/dlmp_path/han/data/m328672/dinov2-main/dgx_vitg14_patch37M/training_287499/teacher_checkpoint.pth",
+                "--batch_size", "2",
+                "--num_epochs", "2",
+                "--lr", "5e-4",
+                "--num_workers", "2",
+                "--output_dir", "./outputs_maskrcnn_debug"
+            ],
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0"
+            },
+            "justMyCode": false
+        },
+        {
+            "name": "Test Hover Model",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/test_hover_model.py",
+            "console": "integratedTerminal",
+            "justMyCode": false
+        },
+        {
+            "name": "Test Model (Basic)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/test_model.py",
+            "console": "integratedTerminal",
+            "justMyCode": false
+        }
+    ]
+}
