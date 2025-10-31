@@ -12,6 +12,7 @@ from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
 from torchvision.ops import MultiScaleRoIAlign
 import torch.nn.functional as F
 from collections import OrderedDict
+import warnings
 
 
 class DINOv2BackboneSimple(nn.Module):
@@ -231,13 +232,33 @@ class ImprovedDINOv2MaskRCNN(nn.Module):
             
             if len(rcnn_targets) == 0:
                 # Return zero losses if no valid targets
+                # Create losses connected to model parameters to allow backpropagation
                 device = image_list[0].device
+                # Get a trainable parameter from the model to connect the loss to the graph
+                trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+                if len(trainable_params) > 0:
+                    dummy_param = trainable_params[0]
+                    # Create separate zero losses for each component (all connected to the graph)
+                    zero_loss = (dummy_param.sum() * 0.0)
+                    zero_loss_classifier = zero_loss.clone()
+                    zero_loss_box_reg = zero_loss.clone()
+                    zero_loss_objectness = zero_loss.clone()
+                    zero_loss_rpn_box_reg = zero_loss.clone()
+                    zero_loss_mask = zero_loss.clone()
+                else:
+                    # Fallback: create zero tensors on device (shouldn't happen if model has trainable params)
+                    zero_loss_classifier = torch.tensor(0.0, device=device, requires_grad=False)
+                    zero_loss_box_reg = torch.tensor(0.0, device=device, requires_grad=False)
+                    zero_loss_objectness = torch.tensor(0.0, device=device, requires_grad=False)
+                    zero_loss_rpn_box_reg = torch.tensor(0.0, device=device, requires_grad=False)
+                    zero_loss_mask = torch.tensor(0.0, device=device, requires_grad=False)
+                warnings.warn(f"No valid targets found in batch of {len(images)} images. Returning zero losses.")
                 return {
-                    'loss_classifier': torch.tensor(0.0, device=device),
-                    'loss_box_reg': torch.tensor(0.0, device=device),
-                    'loss_objectness': torch.tensor(0.0, device=device),
-                    'loss_rpn_box_reg': torch.tensor(0.0, device=device),
-                    'loss_mask': torch.tensor(0.0, device=device)
+                    'loss_classifier': zero_loss_classifier,
+                    'loss_box_reg': zero_loss_box_reg,
+                    'loss_objectness': zero_loss_objectness,
+                    'loss_rpn_box_reg': zero_loss_rpn_box_reg,
+                    'loss_mask': zero_loss_mask
                 }
             
             # Use only images with valid targets

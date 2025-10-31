@@ -388,8 +388,8 @@ def main():
     from hover_dataset_loader import HoverNetDataset, get_transform
     
     train_dataset = HoverNetDataset(
-        images_dir=os.path.join(args.data_root, "train/Images"),
-        labels_dir=os.path.join(args.data_root, "train/Labels"),
+        images_dir=os.path.join(args.data_root, "train/images"),
+        labels_dir=os.path.join(args.data_root, "train/labels"),
         annotations_file=os.path.join(args.data_root, "train/train_annotations.json"),
         transform=get_transform(train=True, target_size=518),
         train=True,
@@ -397,9 +397,9 @@ def main():
     )
     
     val_dataset = HoverNetDataset(
-        images_dir=os.path.join(args.data_root, "val/Images"),
-        labels_dir=os.path.join(args.data_root, "val/Labels"),
-        annotations_file=os.path.join(args.data_root, "val/val_annotations.json"),
+        images_dir=os.path.join(args.data_root, "valid/images"),
+        labels_dir=os.path.join(args.data_root, "valid/labels"),
+        annotations_file=os.path.join(args.data_root, "valid/val_annotations.json"),
         transform=get_transform(train=False, target_size=518),
         train=False,
         augmentation_multiplier=1

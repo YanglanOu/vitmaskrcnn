@@ -1,2 +1,6 @@
 /outputs_maskrcnn_improved
 /__pycache__
+
+/outputs*
+/*dataset
+/logs
