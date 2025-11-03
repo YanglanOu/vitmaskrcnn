@@ -528,28 +528,37 @@ def main():
         else:
             epochs_without_improvement += 1
         
-        # Save checkpoint
-        if epoch % 5 == 0 or is_best:
-            checkpoint = {
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'train_loss': train_loss,
-                'f1_score': f1_score,
-                'best_f1': best_f1,
-            }
-            
-            if scaler:
-                checkpoint['scaler_state_dict'] = scaler.state_dict()
-            
+        # Prepare checkpoint payload once per epoch
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'train_loss': train_loss,
+            'f1_score': f1_score,
+            'best_f1': best_f1,
+        }
+
+        if scaler:
+            checkpoint['scaler_state_dict'] = scaler.state_dict()
+
+        # Save regular checkpoint every 10 epochs
+        if epoch % 10 == 0:
             checkpoint_path = output_dir / f'checkpoint_epoch_{epoch}.pth'
             torch.save(checkpoint, checkpoint_path)
-            
-            if is_best:
-                best_path = output_dir / 'best_model.pth'
-                torch.save(checkpoint, best_path)
-                print(f"✓ Saved best model (F1: {best_f1:.4f})")
+            print(f"✓ Saved checkpoint at epoch {epoch}")
+
+        # Always update best model when improved
+        if is_best:
+            best_path = output_dir / 'best_model.pth'
+            torch.save(checkpoint, best_path)
+            print(f"✓ Saved best model (F1: {best_f1:.4f})")
+
+        # Save final checkpoint at the end of training
+        if epoch == args.num_epochs - 1:
+            final_checkpoint_path = output_dir / 'final_checkpoint.pth'
+            torch.save(checkpoint, final_checkpoint_path)
+            print("✓ Saved final checkpoint")
         
         print(f"\nEpoch {epoch} Summary:")
         print(f"  Train Loss: {train_loss:.4f}")

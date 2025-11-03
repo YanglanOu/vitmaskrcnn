@@ -78,18 +78,62 @@ class HoverNetDataset(Dataset):
         # Get original dimensions
         orig_w, orig_h = image.size
         
-        # Load corresponding mask file
-        mask_path = self.labels_dir / (img_path.stem + '.mat')
+        # Load corresponding mask file - try multiple formats
+        mask_path = None
+        inst_map = None
+        
+        # Try .mat format first
+        mat_path = self.labels_dir / (img_path.stem + '.mat')
+        if mat_path.exists():
+            mat_data = scipy.io.loadmat(str(mat_path))
+            inst_map = mat_data['inst_map']  # Instance segmentation map
+            mask_path = mat_path
+        else:
+            # Try PNG format with .png_label.png pattern (filename.png_label.png)
+            png_path = self.labels_dir / (img_path.stem + '.png_label.png')
+            if png_path.exists():
+                # Load PNG instance map or binary mask
+                png_data = np.array(Image.open(png_path))
+                # If binary (only 0 and 255), convert to instance map using connected components
+                if len(np.unique(png_data)) <= 2:
+                    from scipy import ndimage
+                    binary = png_data > 0
+                    inst_map, _ = ndimage.label(binary)
+                else:
+                    inst_map = png_data
+                mask_path = png_path
+            else:
+                # Try PNG format with _label suffix (filename_label.png)
+                png_path2 = self.labels_dir / (img_path.stem + '_label.png')
+                if png_path2.exists():
+                    png_data = np.array(Image.open(png_path2))
+                    # If binary, convert to instance map
+                    if len(np.unique(png_data)) <= 2:
+                        from scipy import ndimage
+                        binary = png_data > 0
+                        inst_map, _ = ndimage.label(binary)
+                    else:
+                        inst_map = png_data
+                    mask_path = png_path2
+                else:
+                    # Try PNG format without suffix
+                    png_path3 = self.labels_dir / (img_path.stem + '.png')
+                    if png_path3.exists():
+                        png_data = np.array(Image.open(png_path3))
+                        # If binary, convert to instance map
+                        if len(np.unique(png_data)) <= 2:
+                            from scipy import ndimage
+                            binary = png_data > 0
+                            inst_map, _ = ndimage.label(binary)
+                        else:
+                            inst_map = png_data
+                        mask_path = png_path3
         
         boxes = []
         labels = []
         masks = []
         
-        if mask_path.exists():
-            # Load .mat file
-            mat_data = scipy.io.loadmat(str(mask_path))
-            inst_map = mat_data['inst_map']  # Instance segmentation map
-            
+        if inst_map is not None:
             # Extract individual instance masks and bounding boxes
             unique_instances = np.unique(inst_map)
             unique_instances = unique_instances[unique_instances > 0]  # Remove background (0)

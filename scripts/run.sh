@@ -41,7 +41,7 @@ echo "Job ID: $SLURM_JOB_ID"
 echo "Starting training..."
 python train_maskrcnn_improved.py \
 --dinov2_checkpoint /dgx1data/skunkworks/pathology/bloodbytes/data2/m328672/dinov2_h200m_results/vitg14_RS_patch37M_5/eval/training_212499/teacher_checkpoint.pth \
---data_root /dgx1data/skunkworks/pathology/bloodbytes/m341664/data/hoverdata \
+--data_root /dgx1data/skunkworks/pathology/bloodbytes/m341664/data/selected_148/selected_72 \
 --freeze_backbone \
 --output_dir  ./outputs_debug\
 
