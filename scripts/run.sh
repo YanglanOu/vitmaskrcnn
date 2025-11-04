@@ -45,3 +45,26 @@ python train_maskrcnn_improved.py \
 --freeze_backbone \
 --output_dir  ./outputs_debug\
 
+# Check if training was successful
+if [ $? -eq 0 ]; then
+    echo "Training completed successfully. Starting testing..."
+    
+    # Find the most recent output directory
+    OUTPUT_DIR=$(ls -td outputs_debug/run_* | head -n1)
+    CHECKPOINT_PATH="${OUTPUT_DIR}/best_model.pth"
+    
+    echo "Using checkpoint: ${CHECKPOINT_PATH}"
+    
+    # Run testing
+    python test_maskrcnn_improved.py.py \
+    --checkpoint "${CHECKPOINT_PATH}" \
+    --data_root '/dgx1data/skunkworks/pathology/bloodbytes/m341664/data/selected_148/selected_72' \
+    --batch_size 1
+    
+    echo "Testing completed."
+else
+    echo "Training failed. Skipping testing."
+    exit 1
+fi
+
+echo "Finished at: $(date)"

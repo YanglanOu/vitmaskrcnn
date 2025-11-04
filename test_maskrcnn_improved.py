@@ -19,6 +19,7 @@ import matplotlib.patches as patches
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -83,7 +84,7 @@ def visualize_test_predictions(
     image_names: Iterable[str],
     score_threshold: float = 0.05,
 ) -> None:
-    """Visualize predictions, ground-truth boxes, and masks for qualitative review."""
+    """Visualize predictions, ground-truth boxes, masks, and segmentation labels for qualitative review."""
 
     output_dir = Path(output_dir)
     vis_dir = output_dir / "test_visualizations"
@@ -109,7 +110,11 @@ def visualize_test_predictions(
         else:
             orig_h = orig_w = 518
 
-        fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(30, 10))
+        # Get image dimensions for resizing masks
+        img_h, img_w = img.shape[0], img.shape[1]
+
+        # Create 2x2 layout: GT boxes, GT masks, Pred boxes, Pred masks
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(20, 20))
 
         # Ground truth boxes (converted from normalized YOLO format)
         ax1.imshow(img)
@@ -120,13 +125,13 @@ def visualize_test_predictions(
             gt_boxes[:, 2] = (target_boxes_norm[:, 0] + target_boxes_norm[:, 2] / 2) * orig_w
             gt_boxes[:, 3] = (target_boxes_norm[:, 1] + target_boxes_norm[:, 3] / 2) * orig_h
 
-            scale_x = 518 / orig_w
-            scale_y = 518 / orig_h
+            scale_x = img_w / orig_w
+            scale_y = img_h / orig_h
             gt_boxes[:, [0, 2]] *= scale_x
             gt_boxes[:, [1, 3]] *= scale_y
 
             ax1.set_title(
-                f"Ground Truth ({len(gt_boxes)} nuclei, orig: {int(orig_w)}x{int(orig_h)})",
+                f"Ground Truth Boxes ({len(gt_boxes)} nuclei, orig: {int(orig_w)}x{int(orig_h)})",
                 fontsize=14,
             )
             for box in gt_boxes:
@@ -136,17 +141,44 @@ def visualize_test_predictions(
                 )
                 ax1.add_patch(rect)
         else:
-            ax1.set_title("Ground Truth (0 nuclei)", fontsize=14)
+            ax1.set_title("Ground Truth Boxes (0 nuclei)", fontsize=14)
         ax1.axis("off")
 
-        # Predicted boxes (filtered by threshold)
+        # Ground truth masks (segmentation labels)
         ax2.imshow(img)
+        if "masks" in target and len(target["masks"]) > 0:
+            gt_masks = target["masks"].cpu().numpy()
+
+            # Resize masks from original size to current image size
+            gt_masks_tensor = torch.tensor(gt_masks, dtype=torch.float32).unsqueeze(1)  # Add channel dimension
+            gt_masks_resized = F.interpolate(
+                gt_masks_tensor,
+                size=(img_h, img_w),
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(1).numpy()  # Remove channel dimension and convert to numpy
+
+            # Combine all masks with different colors
+            combined_gt_mask = np.zeros((img_h, img_w, 3))
+            colors = plt.cm.Set3(np.linspace(0, 1, len(gt_masks_resized)))
+
+            for i, mask in enumerate(gt_masks_resized):
+                combined_gt_mask[mask > 0.5] = colors[i][:3]
+
+            ax2.imshow(combined_gt_mask, alpha=0.5)
+            ax2.set_title(f"Ground Truth Masks ({len(gt_masks_resized)} masks)", fontsize=14)
+        else:
+            ax2.set_title("No ground truth masks", fontsize=14)
+        ax2.axis("off")
+
+        # Predicted boxes (filtered by threshold)
+        ax3.imshow(img)
         keep = pred_scores > score_threshold
         filtered_boxes = pred_boxes[keep]
         filtered_scores = pred_scores[keep]
 
-        ax2.set_title(
-            f"Predictions (>{score_threshold:.2f}, {len(filtered_boxes)} boxes)", fontsize=14
+        ax3.set_title(
+            f"Predicted Boxes (>{score_threshold:.2f}, {len(filtered_boxes)} boxes)", fontsize=14
         )
         for box, score in zip(filtered_boxes, filtered_scores):
             x1, y1, x2, y2 = box
@@ -154,8 +186,8 @@ def visualize_test_predictions(
             rect = patches.Rectangle(
                 (x1, y1), x2 - x1, y2 - y1, linewidth=2, edgecolor=color, facecolor="none"
             )
-            ax2.add_patch(rect)
-            ax2.text(
+            ax3.add_patch(rect)
+            ax3.text(
                 x1,
                 y1 - 5,
                 f"{score:.2f}",
@@ -163,24 +195,24 @@ def visualize_test_predictions(
                 fontsize=8,
                 bbox=dict(facecolor=color, alpha=0.7),
             )
-        ax2.axis("off")
+        ax3.axis("off")
 
         # Predicted masks
-        ax3.imshow(img)
+        ax4.imshow(img)
         if pred_masks is not None and len(pred_masks) > 0 and keep.any():
-            pred_masks = pred_masks[keep]
-            combined_mask = np.zeros((img.shape[0], img.shape[1], 3))
-            colors = plt.cm.Set3(np.linspace(0, 1, len(pred_masks)))
+            pred_masks_filtered = pred_masks[keep]
+            combined_pred_mask = np.zeros((img_h, img_w, 3))
+            colors = plt.cm.Set3(np.linspace(0, 1, len(pred_masks_filtered)))
 
-            for mask, color in zip(pred_masks, colors):
-                mask_2d = mask[0]
-                combined_mask[mask_2d > 0.5] = color[:3]
+            for mask, color in zip(pred_masks_filtered, colors):
+                mask_2d = mask[0] if len(mask.shape) == 3 else mask
+                combined_pred_mask[mask_2d > 0.5] = color[:3]
 
-            ax3.imshow(combined_mask, alpha=0.5)
-            ax3.set_title(f"Masks ({len(pred_masks)} instances)", fontsize=14)
+            ax4.imshow(combined_pred_mask, alpha=0.5)
+            ax4.set_title(f"Predicted Masks ({len(pred_masks_filtered)} instances)", fontsize=14)
         else:
-            ax3.set_title("Masks (none above threshold)", fontsize=14)
-        ax3.axis("off")
+            ax4.set_title("Masks (none above threshold)", fontsize=14)
+        ax4.axis("off")
 
         plt.tight_layout()
         image_stem = Path(name).stem if name else f"sample_{idx}"
