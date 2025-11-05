@@ -13,6 +13,7 @@ from pathlib import Path
 import json
 from datetime import datetime
 import numpy as np
+from scipy.ndimage import zoom
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 
@@ -31,40 +32,47 @@ def collate_fn_maskrcnn(batch):
 
 def compute_metrics(predictions, targets, iou_threshold=0.5, score_threshold=0.05):
     """
-    Compute precision, recall, F1 for evaluation
-    Fixed: Properly converts normalized YOLO boxes using original image dimensions
+    Compute precision, recall, F1 for evaluation (detection metrics)
+    Also computes segmentation metrics: mask IoU and Dice coefficient
+    Updated for cropped images: boxes are normalized to cropped image size
     """
     true_positives = 0
     false_positives = 0
     false_negatives = 0
     
+    # Segmentation metrics
+    mask_ious = []
+    dice_scores = []
+    
     for pred, target in zip(predictions, targets):
         pred_boxes = pred['boxes'].cpu().numpy()
         pred_scores = pred['scores'].cpu().numpy()
+        pred_masks = pred.get('masks')
+        if pred_masks is not None:
+            pred_masks = pred_masks.cpu().numpy()
         
-        # Get original dimensions
+        # Images are already cropped to target_size (e.g., 224x224) in dataset loader
+        # Get image dimensions from orig_size (which is [crop_size, crop_size])
         if 'orig_size' in target:
-            orig_h, orig_w = target['orig_size'].cpu().numpy()
+            img_h, img_w = target['orig_size'].cpu().numpy()
         else:
-            orig_h, orig_w = 518, 518
+            # Fallback: assume images are already cropped to 224x224
+            img_h, img_w = 224, 224
         
-        # Convert normalized YOLO boxes to absolute coordinates at 518x518
+        # Convert normalized YOLO boxes to absolute coordinates
+        # Boxes are normalized [cx, cy, w, h] relative to the cropped image
         target_boxes_norm = target['boxes'].cpu().numpy()
+        target_masks = target.get('masks')
+        if target_masks is not None:
+            target_masks = target_masks.cpu().numpy()
         
         if len(target_boxes_norm) > 0:
-            # Step 1: Convert normalized to absolute in original image space
-            target_boxes_abs = np.zeros_like(target_boxes_norm)
-            target_boxes_abs[:, 0] = (target_boxes_norm[:, 0] - target_boxes_norm[:, 2] / 2) * orig_w  # x1
-            target_boxes_abs[:, 1] = (target_boxes_norm[:, 1] - target_boxes_norm[:, 3] / 2) * orig_h  # y1
-            target_boxes_abs[:, 2] = (target_boxes_norm[:, 0] + target_boxes_norm[:, 2] / 2) * orig_w  # x2
-            target_boxes_abs[:, 3] = (target_boxes_norm[:, 1] + target_boxes_norm[:, 3] / 2) * orig_h  # y2
-            
-            # Step 2: Scale to 518x518
-            scale_x = 518 / orig_w
-            scale_y = 518 / orig_h
-            target_boxes = target_boxes_abs.copy()
-            target_boxes[:, [0, 2]] *= scale_x
-            target_boxes[:, [1, 3]] *= scale_y
+            # Convert normalized boxes directly to absolute coordinates using cropped image size
+            target_boxes = np.zeros_like(target_boxes_norm)
+            target_boxes[:, 0] = (target_boxes_norm[:, 0] - target_boxes_norm[:, 2] / 2) * img_w  # x1
+            target_boxes[:, 1] = (target_boxes_norm[:, 1] - target_boxes_norm[:, 3] / 2) * img_h  # y1
+            target_boxes[:, 2] = (target_boxes_norm[:, 0] + target_boxes_norm[:, 2] / 2) * img_w  # x2
+            target_boxes[:, 3] = (target_boxes_norm[:, 1] + target_boxes_norm[:, 3] / 2) * img_h  # y2
         else:
             target_boxes = np.zeros((0, 4))
         
@@ -72,6 +80,8 @@ def compute_metrics(predictions, targets, iou_threshold=0.5, score_threshold=0.0
         keep = pred_scores > score_threshold
         pred_boxes = pred_boxes[keep]
         pred_scores = pred_scores[keep]
+        if pred_masks is not None:
+            pred_masks = pred_masks[keep]
         
         if len(pred_boxes) == 0 and len(target_boxes) == 0:
             continue
@@ -89,7 +99,7 @@ def compute_metrics(predictions, targets, iou_threshold=0.5, score_threshold=0.0
             torch.tensor(target_boxes)
         ).numpy()
         
-        # Match predictions to targets
+        # Match predictions to targets and compute mask metrics
         matched_targets = set()
         for i in range(len(pred_boxes)):
             if ious.shape[1] == 0:
@@ -102,6 +112,41 @@ def compute_metrics(predictions, targets, iou_threshold=0.5, score_threshold=0.0
             if max_iou >= iou_threshold and max_iou_idx not in matched_targets:
                 true_positives += 1
                 matched_targets.add(max_iou_idx)
+                
+                # Compute mask IoU and Dice for matched pairs
+                if pred_masks is not None and target_masks is not None and len(target_masks) > max_iou_idx:
+                    pred_mask = pred_masks[i]
+                    gt_mask = target_masks[max_iou_idx]
+                    
+                    # Resize masks to same size if needed
+                    if len(pred_mask.shape) == 3:
+                        pred_mask = pred_mask[0]  # Remove channel dimension
+                    if len(gt_mask.shape) == 3:
+                        gt_mask = gt_mask[0]
+                    
+                    # Resize to match if shapes differ
+                    if pred_mask.shape != gt_mask.shape:
+                        zoom_factors = (gt_mask.shape[0] / pred_mask.shape[0], 
+                                       gt_mask.shape[1] / pred_mask.shape[1])
+                        pred_mask = zoom(pred_mask, zoom_factors, order=1)
+                    
+                    # Binarize masks
+                    pred_binary = (pred_mask > 0.5).astype(np.float32)
+                    gt_binary = (gt_mask > 0.5).astype(np.float32)
+                    
+                    # Compute mask IoU
+                    intersection = np.logical_and(pred_binary, gt_binary).sum()
+                    union = np.logical_or(pred_binary, gt_binary).sum()
+                    if union > 0:
+                        mask_iou = intersection / union
+                        mask_ious.append(mask_iou)
+                    
+                    # Compute Dice coefficient
+                    pred_sum = pred_binary.sum()
+                    gt_sum = gt_binary.sum()
+                    if pred_sum + gt_sum > 0:
+                        dice = (2 * intersection) / (pred_sum + gt_sum)
+                        dice_scores.append(dice)
             else:
                 false_positives += 1
         
@@ -111,13 +156,20 @@ def compute_metrics(predictions, targets, iou_threshold=0.5, score_threshold=0.0
     recall = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
     
+    # Aggregate segmentation metrics
+    avg_mask_iou = np.mean(mask_ious) if mask_ious else 0.0
+    avg_dice = np.mean(dice_scores) if dice_scores else 0.0
+    
     return {
         'precision': precision,
         'recall': recall,
         'f1': f1,
         'tp': true_positives,
         'fp': false_positives,
-        'fn': false_negatives
+        'fn': false_negatives,
+        'mask_iou': avg_mask_iou,
+        'dice': avg_dice,
+        'num_matched_masks': len(mask_ious)
     }
 
 
@@ -231,12 +283,24 @@ def visualize_predictions_vs_targets(images, predictions, targets, epoch, output
             pred_masks = pred_masks[keep]  # Apply same filtering as boxes
             
             # Combine all masks with different colors
+            # Use HSV color space to generate many distinct colors
             combined_pred_mask = np.zeros((img_h, img_w, 3))
-            colors = plt.cm.Set3(np.linspace(0, 1, len(pred_masks)))
+            num_masks = len(pred_masks)
             
             for i, mask in enumerate(pred_masks):
                 mask = mask[0] if len(mask.shape) == 3 else mask  # Remove channel dimension if present
-                combined_pred_mask[mask > 0.5] = colors[i][:3]
+                
+                # Generate distinct colors using HSV: vary hue, keep saturation and value high
+                hue = (i / num_masks) % 1.0  # Cycle through hues
+                saturation = 0.7 + (i % 3) * 0.1  # Vary saturation slightly
+                value = 0.9 + (i % 2) * 0.1  # Vary brightness slightly
+                
+                # Convert HSV to RGB
+                from matplotlib.colors import hsv_to_rgb
+                hsv_color = np.array([[[hue, saturation, value]]])
+                rgb_color = hsv_to_rgb(hsv_color)[0, 0]
+                
+                combined_pred_mask[mask > 0.5] = rgb_color
             
             ax4.imshow(combined_pred_mask, alpha=0.5)
             ax4.set_title(f'Predicted Masks ({len(pred_masks)} masks)', fontsize=14)
@@ -398,6 +462,12 @@ def main():
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--freeze_backbone', action='store_true')
     
+    # Cropping options
+    parser.add_argument('--crop_size', type=int, default=224,
+                       help='Crop size (default: 224)')
+    parser.add_argument('--max_crops_per_image', type=int, default=4,
+                       help='Number of random crops per training image')
+    
     # Advanced options
     parser.add_argument('--warmup_epochs', type=int, default=5)
     parser.add_argument('--use_amp', action='store_true')
@@ -417,48 +487,25 @@ def main():
     
     # Create dataloaders
     print("Loading datasets...")
-    from hover_dataset_loader import HoverNetDataset, get_transform
+    from maskrcnn_crop_dataset_loader import create_dataloaders
     
-    train_dataset = HoverNetDataset(
-        images_dir=os.path.join(args.data_root, "train/images"),
-        labels_dir=os.path.join(args.data_root, "train/labels"),
-        annotations_file=os.path.join(args.data_root, "train/train_annotations.json"),
-        transform=get_transform(train=True, target_size=518),
-        train=True,
-        augmentation_multiplier=args.augmentation_multiplier
-    )
-    
-    val_dataset = HoverNetDataset(
-        images_dir=os.path.join(args.data_root, "valid/images"),
-        labels_dir=os.path.join(args.data_root, "valid/labels"),
-        annotations_file=os.path.join(args.data_root, "valid/val_annotations.json"),
-        transform=get_transform(train=False, target_size=518),
-        train=False,
-        augmentation_multiplier=1
-    )
-    
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset,
+    train_loader, val_loader = create_dataloaders(
+        train_images_dir=os.path.join(args.data_root, "train/images"),
+        train_labels_dir=os.path.join(args.data_root, "train/labels"),
+        val_images_dir=os.path.join(args.data_root, "valid/images"),
+        val_labels_dir=os.path.join(args.data_root, "valid/labels"),
         batch_size=args.batch_size,
-        shuffle=True,
         num_workers=args.num_workers,
-        collate_fn=collate_fn_maskrcnn,
-        pin_memory=True,
-        persistent_workers=True if args.num_workers > 0 else False
+        crop_size=args.crop_size,
+        max_crops_per_image=args.max_crops_per_image,
+        train_annotations_file=os.path.join(args.data_root, "train/train_annotations.json") if os.path.exists(os.path.join(args.data_root, "train/train_annotations.json")) else None,
+        val_annotations_file=os.path.join(args.data_root, "valid/val_annotations.json") if os.path.exists(os.path.join(args.data_root, "valid/val_annotations.json")) else None,
     )
     
-    val_loader = torch.utils.data.DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        collate_fn=collate_fn_maskrcnn,
-        pin_memory=True,
-        persistent_workers=True if args.num_workers > 0 else False
-    )
-    
-    print(f"Train samples: {len(train_dataset)}, batches: {len(train_loader)}")
-    print(f"Val samples: {len(val_dataset)}, batches: {len(val_loader)}")
+    print(f"Train batches: {len(train_loader)}")
+    print(f"Val batches: {len(val_loader)}")
+    print(f"Crop size: {args.crop_size}x{args.crop_size}")
+    print(f"Crops per image: {args.max_crops_per_image}")
     
     # Create model
     print("\nBuilding model...")
@@ -466,7 +513,8 @@ def main():
     
     model = create_improved_maskrcnn(
         dinov2_checkpoint_path=args.dinov2_checkpoint,
-        freeze_backbone=args.freeze_backbone
+        freeze_backbone=args.freeze_backbone,
+        target_size=args.crop_size
     )
     model = model.to(device)
     

@@ -23,7 +23,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from train_maskrcnn_improved import collate_fn_maskrcnn, compute_metrics
+from train_maskrcnn_improved import compute_metrics
 
 
 def _find_existing_path(*candidates: Path) -> Optional[Path]:
@@ -106,12 +106,13 @@ def visualize_test_predictions(
         target_boxes_norm = target["boxes"].cpu().numpy()
         orig_size = target.get("orig_size")
         if orig_size is not None:
-            orig_h, orig_w = orig_size.cpu().numpy()
+            img_h, img_w = orig_size.cpu().numpy()
+            img_h, img_w = int(img_h), int(img_w)  # Convert to integers for array dimensions
         else:
-            orig_h = orig_w = 518
+            img_h = img_w = 224  # Default crop size
 
-        # Get image dimensions for resizing masks
-        img_h, img_w = img.shape[0], img.shape[1]
+        # Get actual image dimensions from numpy array
+        img_h_actual, img_w_actual = img.shape[0], img.shape[1]
 
         # Create 2x2 layout: GT boxes, GT masks, Pred boxes, Pred masks
         fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(20, 20))
@@ -119,19 +120,15 @@ def visualize_test_predictions(
         # Ground truth boxes (converted from normalized YOLO format)
         ax1.imshow(img)
         if len(target_boxes_norm) > 0:
+            # Convert normalized boxes directly to absolute coordinates using cropped image size
             gt_boxes = np.zeros_like(target_boxes_norm)
-            gt_boxes[:, 0] = (target_boxes_norm[:, 0] - target_boxes_norm[:, 2] / 2) * orig_w
-            gt_boxes[:, 1] = (target_boxes_norm[:, 1] - target_boxes_norm[:, 3] / 2) * orig_h
-            gt_boxes[:, 2] = (target_boxes_norm[:, 0] + target_boxes_norm[:, 2] / 2) * orig_w
-            gt_boxes[:, 3] = (target_boxes_norm[:, 1] + target_boxes_norm[:, 3] / 2) * orig_h
-
-            scale_x = img_w / orig_w
-            scale_y = img_h / orig_h
-            gt_boxes[:, [0, 2]] *= scale_x
-            gt_boxes[:, [1, 3]] *= scale_y
-
+            gt_boxes[:, 0] = (target_boxes_norm[:, 0] - target_boxes_norm[:, 2] / 2) * img_w  # x1
+            gt_boxes[:, 1] = (target_boxes_norm[:, 1] - target_boxes_norm[:, 3] / 2) * img_h  # y1
+            gt_boxes[:, 2] = (target_boxes_norm[:, 0] + target_boxes_norm[:, 2] / 2) * img_w  # x2
+            gt_boxes[:, 3] = (target_boxes_norm[:, 1] + target_boxes_norm[:, 3] / 2) * img_h  # y2
+            
             ax1.set_title(
-                f"Ground Truth Boxes ({len(gt_boxes)} nuclei, orig: {int(orig_w)}x{int(orig_h)})",
+                f"Ground Truth Boxes ({len(gt_boxes)} nuclei, crop: {int(img_w)}x{int(img_h)})",
                 fontsize=14,
             )
             for box in gt_boxes:
@@ -148,25 +145,20 @@ def visualize_test_predictions(
         ax2.imshow(img)
         if "masks" in target and len(target["masks"]) > 0:
             gt_masks = target["masks"].cpu().numpy()
-
-            # Resize masks from original size to current image size
-            gt_masks_tensor = torch.tensor(gt_masks, dtype=torch.float32).unsqueeze(1)  # Add channel dimension
-            gt_masks_resized = F.interpolate(
-                gt_masks_tensor,
-                size=(img_h, img_w),
-                mode="bilinear",
-                align_corners=False,
-            ).squeeze(1).numpy()  # Remove channel dimension and convert to numpy
-
+            # Masks are already cropped to img_h x img_w, no resizing needed
+            gt_masks_array = gt_masks  # Shape: [N, H, W] where H=W=crop_size
+            
             # Combine all masks with different colors
-            combined_gt_mask = np.zeros((img_h, img_w, 3))
-            colors = plt.cm.Set3(np.linspace(0, 1, len(gt_masks_resized)))
+            # Use actual image dimensions
+            mask_h, mask_w = gt_masks_array.shape[1], gt_masks_array.shape[2]
+            combined_gt_mask = np.zeros((mask_h, mask_w, 3))
+            colors = plt.cm.Set3(np.linspace(0, 1, len(gt_masks_array)))
 
-            for i, mask in enumerate(gt_masks_resized):
+            for i, mask in enumerate(gt_masks_array):
                 combined_gt_mask[mask > 0.5] = colors[i][:3]
 
             ax2.imshow(combined_gt_mask, alpha=0.5)
-            ax2.set_title(f"Ground Truth Masks ({len(gt_masks_resized)} masks)", fontsize=14)
+            ax2.set_title(f"Ground Truth Masks ({len(gt_masks_array)} masks)", fontsize=14)
         else:
             ax2.set_title("No ground truth masks", fontsize=14)
         ax2.axis("off")
@@ -201,11 +193,17 @@ def visualize_test_predictions(
         ax4.imshow(img)
         if pred_masks is not None and len(pred_masks) > 0 and keep.any():
             pred_masks_filtered = pred_masks[keep]
-            combined_pred_mask = np.zeros((img_h, img_w, 3))
+            # Use actual image dimensions for mask visualization
+            combined_pred_mask = np.zeros((img_h_actual, img_w_actual, 3))
             colors = plt.cm.Set3(np.linspace(0, 1, len(pred_masks_filtered)))
 
             for mask, color in zip(pred_masks_filtered, colors):
                 mask_2d = mask[0] if len(mask.shape) == 3 else mask
+                # Resize mask if needed to match image size
+                if mask_2d.shape != (img_h_actual, img_w_actual):
+                    from scipy.ndimage import zoom
+                    zoom_factors = (img_h_actual / mask_2d.shape[0], img_w_actual / mask_2d.shape[1])
+                    mask_2d = zoom(mask_2d, zoom_factors, order=1)
                 combined_pred_mask[mask_2d > 0.5] = color[:3]
 
             ax4.imshow(combined_pred_mask, alpha=0.5)
@@ -272,11 +270,14 @@ def test_model(
         )
 
     freeze_backbone = config.get("freeze_backbone", True)
+    crop_size = config.get("crop_size", 224)  # Get crop_size from config, default to 224
 
+    print(f"\nUsing crop_size: {crop_size}x{crop_size}")
     print("\nBuilding model...")
     model = create_improved_maskrcnn(
         dinov2_checkpoint_path=dinov2_checkpoint,
         freeze_backbone=freeze_backbone,
+        target_size=crop_size  # Use crop_size from config
     )
     model.load_state_dict(checkpoint["model_state_dict"])
     model = model.to(device)
@@ -293,8 +294,8 @@ def test_model(
     print(f"  F1 Score: {f1_score}")
 
     # Prepare dataloader
-    from hover_dataset_loader import HoverNetDataset, get_transform
-
+    from maskrcnn_crop_dataset_loader import MaskRCNNCropDataset, collate_fn
+    
     try:
         image_dir, label_dir, annotation_path = _resolve_split_paths(data_root, split)
     except FileNotFoundError as exc:
@@ -305,13 +306,14 @@ def test_model(
         else:
             raise
 
-    dataset = HoverNetDataset(
+    dataset = MaskRCNNCropDataset(
         images_dir=str(image_dir),
         labels_dir=str(label_dir),
-        annotations_file=str(annotation_path) if annotation_path else None,
-        transform=get_transform(train=False, target_size=518),
+        crop_size=crop_size,
         train=False,
-        augmentation_multiplier=1,
+        max_crops_per_image=1,
+        min_nuclei_per_crop=0,  # Allow empty crops in testing
+        annotations_file=str(annotation_path) if annotation_path else None,
     )
 
     dataloader = DataLoader(
@@ -319,7 +321,7 @@ def test_model(
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        collate_fn=collate_fn_maskrcnn,
+        collate_fn=collate_fn,
         pin_memory=device.type == "cuda",
         persistent_workers=num_workers > 0,
     )
@@ -385,6 +387,9 @@ def test_model(
                     visual_targets.append(targets_cpu[img_idx])
                     visual_names.append(image_name)
 
+    if visualize:
+        print(f"Collected {len(visual_images)} images for visualization (max: {max_visualizations})")
+
     print("\nComputing metrics...")
     metrics = compute_metrics(
         all_predictions,
@@ -423,6 +428,11 @@ def test_model(
         print("\nMask statistics:")
         print(f"  Avg mask pixels:   {avg_mask_pixels:.1f}")
         print(f"  Avg mask fraction: {avg_mask_fraction:.4f}")
+    if 'mask_iou' in metrics and metrics.get('num_matched_masks', 0) > 0:
+        print("\nSegmentation metrics:")
+        print(f"  Avg Mask IoU:      {metrics['mask_iou']:.4f}")
+        print(f"  Avg Dice Coeff:    {metrics['dice']:.4f}")
+        print(f"  Matched masks:      {metrics['num_matched_masks']}")
     print("=" * 70)
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -449,23 +459,44 @@ def test_model(
         },
         "test_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
+    
+    # Add segmentation metrics if available
+    if 'mask_iou' in metrics:
+        results["segmentation_metrics"] = {
+            "mask_iou": float(metrics["mask_iou"]),
+            "dice": float(metrics["dice"]),
+            "num_matched_masks": int(metrics.get("num_matched_masks", 0))
+        }
 
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2)
 
     print(f"\nResults saved to: {results_path}")
 
-    if visualize and visual_images:
-        print("\nGenerating visualizations...")
-        visualize_test_predictions(
-            visual_images,
-            visual_predictions,
-            visual_targets,
-            output_dir,
-            visual_names,
-            score_threshold=score_threshold,
-        )
-        print(f"Visualizations saved to: {output_dir / 'test_visualizations'}")
+    if visualize:
+        if visual_images:
+            print("\nGenerating visualizations...")
+            try:
+                visualize_test_predictions(
+                    visual_images,
+                    visual_predictions,
+                    visual_targets,
+                    output_dir,
+                    visual_names,
+                    score_threshold=score_threshold,
+                )
+                print(f"Visualizations saved to: {output_dir / 'test_visualizations'}")
+            except Exception as e:
+                print(f"Error generating visualizations: {e}")
+                import traceback
+                traceback.print_exc()
+        else:
+            print("\nWarning: No images collected for visualization. This may indicate:")
+            print("  - Dataset is empty or no images were processed")
+            print("  - Visualization was disabled during inference")
+            print(f"  - Collected {len(visual_images)} images, expected up to {max_visualizations}")
+    else:
+        print("\nVisualizations skipped (--no_visualize flag used)")
 
     return metrics
 

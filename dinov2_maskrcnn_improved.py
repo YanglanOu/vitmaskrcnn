@@ -1,5 +1,6 @@
 """
 Improved DINOv2 + Mask R-CNN with proper coordinate conversion
+Optimized for cropped images (e.g., 224x224) instead of resizing
 Fixed: Handles variable-sized images correctly
 Added: Mask prediction head for instance segmentation
 """
@@ -79,19 +80,23 @@ class DINOv2BackboneSimple(nn.Module):
 class ImprovedDINOv2MaskRCNN(nn.Module):
     """
     Mask R-CNN with DINOv2 backbone
+    Optimized for cropped images (e.g., 224x224) instead of resizing
     Properly handles variable-sized images with correct coordinate conversion
     Includes mask prediction head for instance segmentation
     """
-    def __init__(self, dinov2_model, num_classes=2, freeze_backbone=True):
+    def __init__(self, dinov2_model, num_classes=2, freeze_backbone=True, target_size=224):
         super().__init__()
+        
+        self.target_size = target_size
         
         # Create simple backbone
         backbone = DINOv2BackboneSimple(dinov2_model, freeze=freeze_backbone)
         
         # Anchor generator with custom sizes for nuclei
+        # Adjust anchor sizes based on target_size if needed
         anchor_generator = AnchorGenerator(
-            sizes=((8, 12, 16, 20, 24, 30, 36, 42, 48, 60),),
-            aspect_ratios=((0.5, 0.75, 1.0, 1.25, 1.5),)
+            sizes=((4, 6, 8, 10, 12, 16, 20, 24, 32),),
+            aspect_ratios=((0.5, 0.75, 1.0, 1.25, 1.5, 2.0),)
         )
         
         # RoI pooling
@@ -108,22 +113,24 @@ class ImprovedDINOv2MaskRCNN(nn.Module):
             sampling_ratio=2
         )
         
-        # Create Mask R-CNN
+        # Create Mask R-CNN with default transform
+        # Images are already cropped to target_size in dataset loader
+        # So we just set min_size/max_size to match (images won't be resized)
         self.model = MaskRCNN(
             backbone=backbone,
             num_classes=num_classes,
             rpn_anchor_generator=anchor_generator,
             box_roi_pool=roi_pooler,
             mask_roi_pool=mask_roi_pooler,
-            min_size=896,
-            max_size=1024,
+            min_size=target_size,
+            max_size=target_size,
             image_mean=[0.485, 0.456, 0.406],
             image_std=[0.229, 0.224, 0.225],
             # RPN parameters
-            rpn_pre_nms_top_n_train=2000,
-            rpn_pre_nms_top_n_test=1000,
+            rpn_pre_nms_top_n_train=4000,
+            rpn_pre_nms_top_n_test=3000,
             rpn_post_nms_top_n_train=2000,
-            rpn_post_nms_top_n_test=1000,
+            rpn_post_nms_top_n_test=1500,
             rpn_nms_thresh=0.7,
             rpn_fg_iou_thresh=0.5,
             rpn_bg_iou_thresh=0.3,
@@ -142,7 +149,8 @@ class ImprovedDINOv2MaskRCNN(nn.Module):
     def forward(self, images, targets=None):
         """
         Forward pass with proper coordinate conversion
-        Converts normalized YOLO boxes using original image dimensions
+        Images are already cropped to target_size in dataset loader
+        Boxes are normalized [cx, cy, w, h] relative to the cropped image
         """
         # Convert to list format
         if isinstance(images, torch.Tensor):
@@ -159,38 +167,24 @@ class ImprovedDINOv2MaskRCNN(nn.Module):
             valid_indices = []
             
             for i, target in enumerate(targets):
-                # Get ORIGINAL image dimensions (before resize to 518x518)
-                if 'orig_size' in target:
-                    # orig_size is stored as [height, width]
-                    orig_h, orig_w = target['orig_size'].cpu().numpy()
-                else:
-                    # Fallback: assume already 518x518
-                    img_h, img_w = image_list[i].shape[-2:]
-                    orig_h, orig_w = float(img_h), float(img_w)
+                # Images are already cropped to target_size in dataset loader
+                # Boxes are normalized [cx, cy, w, h] relative to the cropped image
+                img_h, img_w = image_list[i].shape[-2:]  # Should be target_size x target_size
                 
-                boxes = target['boxes']  # Normalized YOLO format [cx, cy, w, h]
+                boxes = target['boxes']  # Normalized YOLO format [cx, cy, w, h] relative to cropped image
                 
                 if len(boxes) == 0:
                     continue
                 
-                # Step 1: Convert normalized YOLO to absolute coordinates in ORIGINAL image space
-                # YOLO format: class_id center_x center_y width height (all normalized 0-1)
-                boxes_abs = torch.zeros_like(boxes)
-                boxes_abs[:, 0] = (boxes[:, 0] - boxes[:, 2] / 2) * orig_w  # x1 = (cx - w/2) * width
-                boxes_abs[:, 1] = (boxes[:, 1] - boxes[:, 3] / 2) * orig_h  # y1 = (cy - h/2) * height
-                boxes_abs[:, 2] = (boxes[:, 0] + boxes[:, 2] / 2) * orig_w  # x2 = (cx + w/2) * width
-                boxes_abs[:, 3] = (boxes[:, 1] + boxes[:, 3] / 2) * orig_h  # y2 = (cy + h/2) * height
+                # Convert normalized YOLO boxes to absolute XYXY coordinates
+                # Boxes are already normalized to the cropped image, so use current image size directly
+                boxes_xyxy = torch.zeros_like(boxes)
+                boxes_xyxy[:, 0] = (boxes[:, 0] - boxes[:, 2] / 2) * img_w  # x1 = (cx - w/2) * width
+                boxes_xyxy[:, 1] = (boxes[:, 1] - boxes[:, 3] / 2) * img_h  # y1 = (cy - h/2) * height
+                boxes_xyxy[:, 2] = (boxes[:, 0] + boxes[:, 2] / 2) * img_w  # x2 = (cx + w/2) * width
+                boxes_xyxy[:, 3] = (boxes[:, 1] + boxes[:, 3] / 2) * img_h  # y2 = (cy + h/2) * height
                 
-                # Step 2: Scale from original dimensions to resized dimensions (518x518)
-                img_h, img_w = image_list[i].shape[-2:]
-                scale_x = img_w / orig_w
-                scale_y = img_h / orig_h
-                
-                boxes_xyxy = boxes_abs.clone()
-                boxes_xyxy[:, [0, 2]] *= scale_x
-                boxes_xyxy[:, [1, 3]] *= scale_y
-                
-                # Clamp to resized image boundaries
+                # Clamp to image boundaries
                 boxes_xyxy[:, 0].clamp_(min=0, max=img_w)
                 boxes_xyxy[:, 1].clamp_(min=0, max=img_h)
                 boxes_xyxy[:, 2].clamp_(min=0, max=img_w)
@@ -210,15 +204,10 @@ class ImprovedDINOv2MaskRCNN(nn.Module):
                 
                 # Use real masks if available, otherwise create dummy masks
                 if 'masks' in target and len(target['masks']) > 0:
-                    # Use real masks from dataset
+                    # Masks are already cropped to img_h x img_w in dataset loader
                     real_masks = target['masks'][valid_boxes]  # Filter masks by valid boxes
-                    # Resize masks to current image size
-                    masks = F.interpolate(
-                        real_masks.unsqueeze(1),  # Add channel dimension
-                        size=(img_h, img_w),
-                        mode='bilinear',
-                        align_corners=False
-                    ).squeeze(1)  # Remove channel dimension
+                    # Masks should already be the right size (target_size x target_size)
+                    masks = real_masks
                 else:
                     # Fallback to dummy masks
                     masks = self._create_dummy_masks(boxes_xyxy, img_h, img_w)
@@ -292,7 +281,7 @@ class ImprovedDINOv2MaskRCNN(nn.Module):
         return torch.stack(masks) if masks else torch.zeros((0, img_h, img_w), dtype=torch.float32, device=boxes.device)
 
 
-def create_improved_maskrcnn(dinov2_checkpoint_path, freeze_backbone=True):
+def create_improved_maskrcnn(dinov2_checkpoint_path, freeze_backbone=True, target_size=224):
     """Create improved Mask R-CNN model with DINOv2 backbone"""
     from dinov2_detr import load_dinov2_from_checkpoint
     
@@ -301,7 +290,8 @@ def create_improved_maskrcnn(dinov2_checkpoint_path, freeze_backbone=True):
     model = ImprovedDINOv2MaskRCNN(
         dinov2_model=dinov2,
         num_classes=2,
-        freeze_backbone=freeze_backbone
+        freeze_backbone=freeze_backbone,
+        target_size=target_size
     )
     
     return model
@@ -328,7 +318,7 @@ if __name__ == "__main__":
     model = model.to(device)
     model.eval()
     
-    dummy_input = [torch.randn(3, 518, 518).to(device)]
+    dummy_input = [torch.randn(3, 224, 224).to(device)]
     with torch.no_grad():
         output = model(dummy_input)
     

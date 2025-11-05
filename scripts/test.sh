@@ -22,8 +22,8 @@ mkdir -p logs/${LOG_DATE}
 echo "Log directory: logs/${LOG_DATE}"
 
 # ---------------- Redirect Output to Date-Based Logs ----------------
-exec 1>logs/${LOG_DATE}/vitg-14-fasterrcnn-fb-518_37MRSvitG_${SLURM_JOB_ID}.out
-exec 2>logs/${LOG_DATE}/vitg-14-fasterrcnn-fb-518_37MRSvitG_${SLURM_JOB_ID}.err
+exec 1>logs/${LOG_DATE}/vitg-14-maskrcnn-fb-518_37MRSvitG_${SLURM_JOB_ID}.out
+exec 2>logs/${LOG_DATE}/vitg-14-maskrcnn-fb-518_37MRSvitG_${SLURM_JOB_ID}.err
 
 # ---------------- NCCL Stability Settings ----------------
 export NCCL_TIMEOUT=3600
@@ -38,33 +38,8 @@ echo "Start time: $(date)"
 echo "Job ID: $SLURM_JOB_ID"
 
 # ---------------- Main Command ----------------
-echo "Starting training..."
-python train_maskrcnn_improved.py \
---dinov2_checkpoint /dgx1data/skunkworks/pathology/bloodbytes/data2/m328672/dinov2_h200m_results/vitg14_RS_patch37M_5/eval/training_212499/teacher_checkpoint.pth \
---data_root /dgx1data/skunkworks/pathology/bloodbytes/m341664/data/selected_148/selected_72 \
---freeze_backbone \
---output_dir  ./outputs_debug\
-
-# Check if training was successful
-if [ $? -eq 0 ]; then
-    echo "Training completed successfully. Starting testing..."
-    
-    # Find the most recent output directory
-    OUTPUT_DIR=$(ls -td outputs_debug/run_* | head -n1)
-    CHECKPOINT_PATH="${OUTPUT_DIR}/best_model.pth"
-    
-    echo "Using checkpoint: ${CHECKPOINT_PATH}"
-    
-    # Run testing
-    python test_maskrcnn_improved.py \
-    --checkpoint "${CHECKPOINT_PATH}" \
-    --data_root '/dgx1data/skunkworks/pathology/bloodbytes/m341664/data/selected_148/selected_72' \
-    --batch_size 1
-    
-    echo "Testing completed."
-else
-    echo "Training failed. Skipping testing."
-    exit 1
-fi
-
-echo "Finished at: $(date)"
+echo "Starting testing..."
+python test_maskrcnn_improved.py \
+--checkpoint "outputs_debug/run_20251104_193104/best_model.pth" \
+--data_root '/dgx1data/skunkworks/pathology/bloodbytes/m341664/data/selected_148/selected_72' \
+--batch_size 1

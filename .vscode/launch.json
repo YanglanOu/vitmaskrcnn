@@ -39,11 +39,10 @@
             "program": "${workspaceFolder}/train_maskrcnn_improved.py",
             "console": "integratedTerminal",
             "args": [
-                "--data_root", "maskrcnn_dataset",
+                "--data_root", "/dgx1data/skunkworks/pathology/bloodbytes/m341664/data/selected_148/selected_72",
                 "--dinov2_checkpoint", "/dgx1data/skunkworks/pathology/bloodbytes/data2/m328672/dinov2_h200m_results/vitg14_RS_patch37M_5/eval/training_212499/teacher_checkpoint.pth",
                 "--batch_size", "2",
                 "--num_epochs", "2",
-                "--lr", "5e-4",
                 "--num_workers", "2",
                 "--output_dir", "./outputs_maskrcnn_debug"
             ],
