@@ -180,7 +180,8 @@ def visualize_predictions_vs_targets(images, predictions, targets, epoch, output
     vis_dir.mkdir(exist_ok=True)
     
     for idx in range(min(num_samples, len(images))):
-        img = images[idx].cpu().numpy()
+        img_tensor = images[idx].detach().cpu()
+        img = img_tensor.numpy()
         
         # Denormalize if needed (Mask R-CNN doesn't normalize input)
         if img.max() <= 1.0:
@@ -192,36 +193,38 @@ def visualize_predictions_vs_targets(images, predictions, targets, epoch, output
         pred = predictions[idx]
         target = targets[idx]
         
+        # Determine image spatial dimensions (after cropping)
+        img_h, img_w = img_tensor.shape[1], img_tensor.shape[2]
+        img_h = int(img_h)
+        img_w = int(img_w)
+        
         # Create 2x2 layout: GT boxes, GT masks, Pred boxes, Pred masks
         fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(20, 20))
         
-        # Get original dimensions
+        # Get original dimensions (for logging)
         if 'orig_size' in target:
             orig_h, orig_w = target['orig_size'].cpu().numpy()
         else:
-            orig_h, orig_w = 518, 518
-        
-        # Get image dimensions for resizing masks
-        img_h, img_w = img.shape[0], img.shape[1]
+            orig_h, orig_w = img_h, img_w
+        orig_h = int(orig_h)
+        orig_w = int(orig_w)
         
         # Ground truth - boxes
         ax1.imshow(img)
         target_boxes_norm = target['boxes'].cpu().numpy()
         
         if len(target_boxes_norm) > 0:
-            # Convert to absolute at original size then scale to 518x518
+            # Convert normalized boxes directly to absolute coordinates using crop dimensions
             gt_boxes = np.zeros_like(target_boxes_norm)
-            gt_boxes[:, 0] = (target_boxes_norm[:, 0] - target_boxes_norm[:, 2] / 2) * orig_w
-            gt_boxes[:, 1] = (target_boxes_norm[:, 1] - target_boxes_norm[:, 3] / 2) * orig_h
-            gt_boxes[:, 2] = (target_boxes_norm[:, 0] + target_boxes_norm[:, 2] / 2) * orig_w
-            gt_boxes[:, 3] = (target_boxes_norm[:, 1] + target_boxes_norm[:, 3] / 2) * orig_h
+            gt_boxes[:, 0] = (target_boxes_norm[:, 0] - target_boxes_norm[:, 2] / 2) * img_w
+            gt_boxes[:, 1] = (target_boxes_norm[:, 1] - target_boxes_norm[:, 3] / 2) * img_h
+            gt_boxes[:, 2] = (target_boxes_norm[:, 0] + target_boxes_norm[:, 2] / 2) * img_w
+            gt_boxes[:, 3] = (target_boxes_norm[:, 1] + target_boxes_norm[:, 3] / 2) * img_h
             
-            scale_x = img_w / orig_w
-            scale_y = img_h / orig_h
-            gt_boxes[:, [0, 2]] *= scale_x
-            gt_boxes[:, [1, 3]] *= scale_y
-            
-            ax1.set_title(f'Ground Truth Boxes ({len(gt_boxes)} nuclei, orig: {orig_w}x{orig_h})', fontsize=14)
+            ax1.set_title(
+                f'Ground Truth Boxes ({len(gt_boxes)} nuclei, crop: {img_w}x{img_h}, orig: {orig_w}x{orig_h})',
+                fontsize=14
+            )
             for box in gt_boxes:
                 x1, y1, x2, y2 = box
                 rect = patches.Rectangle((x1, y1), x2-x1, y2-y1, 

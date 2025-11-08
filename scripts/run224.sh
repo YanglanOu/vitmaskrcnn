@@ -43,14 +43,14 @@ python train_maskrcnn_improved.py \
 --dinov2_checkpoint /dgx1data/skunkworks/pathology/bloodbytes/data2/m328672/dinov2_h200m_results/vitg14_RS_patch37M_5/eval/training_212499/teacher_checkpoint.pth \
 --data_root /dgx1data/skunkworks/pathology/bloodbytes/m341664/data/selected_148/selected_72 \
 --freeze_backbone \
---output_dir  ./outputs_debug\
+--output_dir  ./outputs/panoptils_fold_1\
 
 # Check if training was successful
 if [ $? -eq 0 ]; then
     echo "Training completed successfully. Starting testing..."
     
     # Find the most recent output directory
-    OUTPUT_DIR=$(ls -td outputs_debug/run_* | head -n1)
+    OUTPUT_DIR=$(ls -td outputs/panoptils_fold_1/run_* | head -n1)
     CHECKPOINT_PATH="${OUTPUT_DIR}/best_model.pth"
     
     echo "Using checkpoint: ${CHECKPOINT_PATH}"
