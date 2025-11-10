@@ -16,6 +16,11 @@
 source /home/m341664/miniconda3/etc/profile.d/conda.sh
 conda activate vitfasterrcnn   # Replace with your env if different
 
+# ---------------- Clear Python Cache ----------------
+# Ensure we're using the latest code, not cached bytecode
+find /home/m341664/yanglanou/projects/vitmaskrcnn -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+find /home/m341664/yanglanou/projects/vitmaskrcnn -name "*.pyc" -delete 2>/dev/null || true
+
 # ---------------- Create Log Directory ----------------
 LOG_DATE=$(date +%Y%m%d)
 mkdir -p logs/${LOG_DATE}
@@ -41,16 +46,17 @@ echo "Job ID: $SLURM_JOB_ID"
 echo "Starting training..."
 python train_maskrcnn_improved.py \
 --dinov2_checkpoint /dgx1data/skunkworks/pathology/bloodbytes/data2/m328672/dinov2_h200m_results/vitg14_RS_patch37M_5/eval/training_212499/teacher_checkpoint.pth \
---data_root /dgx1data/skunkworks/pathology/bloodbytes/m341664/data/selected_148/selected_72 \
+--data_root /dgx1data/skunkworks/pathology/bloodbytes/m341664/data/PanopTILs/bootstrapped_nuclei_labels/debug \
 --freeze_backbone \
---output_dir  ./outputs/panoptils_fold_1\
+--collapse_categories \
+--output_dir  ./outputs/panoptils_debug\
 
 # Check if training was successful
 if [ $? -eq 0 ]; then
     echo "Training completed successfully. Starting testing..."
     
     # Find the most recent output directory
-    OUTPUT_DIR=$(ls -td outputs/panoptils_fold_1/run_* | head -n1)
+    OUTPUT_DIR=$(ls -td outputs/panoptils_debug/run_* | head -n1)
     CHECKPOINT_PATH="${OUTPUT_DIR}/best_model.pth"
     
     echo "Using checkpoint: ${CHECKPOINT_PATH}"
@@ -58,7 +64,7 @@ if [ $? -eq 0 ]; then
     # Run testing
     python test_maskrcnn_improved.py \
     --checkpoint "${CHECKPOINT_PATH}" \
-    --data_root '/dgx1data/skunkworks/pathology/bloodbytes/m341664/data/selected_148/selected_72' \
+    --data_root '/dgx1data/skunkworks/pathology/bloodbytes/m341664/data/PanopTILs/bootstrapped_nuclei_labels/debug' \
     --batch_size 1
     
     echo "Testing completed."

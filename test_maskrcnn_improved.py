@@ -104,14 +104,7 @@ def visualize_test_predictions(
         pred_masks = pred_masks.cpu().numpy() if pred_masks is not None else None
 
         target_boxes_norm = target["boxes"].cpu().numpy()
-        orig_size = target.get("orig_size")
-        if orig_size is not None:
-            img_h, img_w = orig_size.cpu().numpy()
-            img_h, img_w = int(img_h), int(img_w)  # Convert to integers for array dimensions
-        else:
-            img_h = img_w = 224  # Default crop size
-
-        # Get actual image dimensions from numpy array
+        # Actual visualization resolution
         img_h_actual, img_w_actual = img.shape[0], img.shape[1]
 
         # Create 2x2 layout: GT boxes, GT masks, Pred boxes, Pred masks
@@ -120,15 +113,19 @@ def visualize_test_predictions(
         # Ground truth boxes (converted from normalized YOLO format)
         ax1.imshow(img)
         if len(target_boxes_norm) > 0:
-            # Convert normalized boxes directly to absolute coordinates using cropped image size
+            # Convert normalized YOLO boxes directly to absolute image coordinates
             gt_boxes = np.zeros_like(target_boxes_norm)
-            gt_boxes[:, 0] = (target_boxes_norm[:, 0] - target_boxes_norm[:, 2] / 2) * img_w  # x1
-            gt_boxes[:, 1] = (target_boxes_norm[:, 1] - target_boxes_norm[:, 3] / 2) * img_h  # y1
-            gt_boxes[:, 2] = (target_boxes_norm[:, 0] + target_boxes_norm[:, 2] / 2) * img_w  # x2
-            gt_boxes[:, 3] = (target_boxes_norm[:, 1] + target_boxes_norm[:, 3] / 2) * img_h  # y2
-            
+            gt_boxes[:, 0] = (target_boxes_norm[:, 0] - target_boxes_norm[:, 2] / 2) * img_w_actual  # x1
+            gt_boxes[:, 1] = (target_boxes_norm[:, 1] - target_boxes_norm[:, 3] / 2) * img_h_actual  # y1
+            gt_boxes[:, 2] = (target_boxes_norm[:, 0] + target_boxes_norm[:, 2] / 2) * img_w_actual  # x2
+            gt_boxes[:, 3] = (target_boxes_norm[:, 1] + target_boxes_norm[:, 3] / 2) * img_h_actual  # y2
+
+            # Clip to image bounds to avoid rendering artifacts
+            gt_boxes[:, [0, 2]] = np.clip(gt_boxes[:, [0, 2]], 0, img_w_actual)
+            gt_boxes[:, [1, 3]] = np.clip(gt_boxes[:, [1, 3]], 0, img_h_actual)
+
             ax1.set_title(
-                f"Ground Truth Boxes ({len(gt_boxes)} nuclei, crop: {int(img_w)}x{int(img_h)})",
+                f"Ground Truth Boxes ({len(gt_boxes)} nuclei, crop: {img_w_actual}x{img_h_actual})",
                 fontsize=14,
             )
             for box in gt_boxes:
@@ -144,21 +141,24 @@ def visualize_test_predictions(
         # Ground truth masks (segmentation labels)
         ax2.imshow(img)
         if "masks" in target and len(target["masks"]) > 0:
-            gt_masks = target["masks"].cpu().numpy()
-            # Masks are already cropped to img_h x img_w, no resizing needed
-            gt_masks_array = gt_masks  # Shape: [N, H, W] where H=W=crop_size
-            
-            # Combine all masks with different colors
-            # Use actual image dimensions
-            mask_h, mask_w = gt_masks_array.shape[1], gt_masks_array.shape[2]
-            combined_gt_mask = np.zeros((mask_h, mask_w, 3))
-            colors = plt.cm.Set3(np.linspace(0, 1, len(gt_masks_array)))
+            gt_masks = target["masks"].cpu()
+            if gt_masks.dim() == 3:
+                gt_masks = gt_masks.unsqueeze(1)
+            gt_masks_resized = F.interpolate(
+                gt_masks.float(),
+                size=(img_h_actual, img_w_actual),
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(1).numpy()
 
-            for i, mask in enumerate(gt_masks_array):
+            combined_gt_mask = np.zeros((img_h_actual, img_w_actual, 3))
+            colors = plt.cm.Set3(np.linspace(0, 1, len(gt_masks_resized)))
+
+            for i, mask in enumerate(gt_masks_resized):
                 combined_gt_mask[mask > 0.5] = colors[i][:3]
 
             ax2.imshow(combined_gt_mask, alpha=0.5)
-            ax2.set_title(f"Ground Truth Masks ({len(gt_masks_array)} masks)", fontsize=14)
+            ax2.set_title(f"Ground Truth Masks ({len(gt_masks_resized)} masks)", fontsize=14)
         else:
             ax2.set_title("No ground truth masks", fontsize=14)
         ax2.axis("off")
@@ -271,6 +271,7 @@ def test_model(
 
     freeze_backbone = config.get("freeze_backbone", True)
     crop_size = config.get("crop_size", 224)  # Get crop_size from config, default to 224
+    collapse_categories = config.get("collapse_categories", False)
 
     print(f"\nUsing crop_size: {crop_size}x{crop_size}")
     print("\nBuilding model...")
@@ -314,6 +315,7 @@ def test_model(
         max_crops_per_image=1,
         min_nuclei_per_crop=0,  # Allow empty crops in testing
         annotations_file=str(annotation_path) if annotation_path else None,
+        collapse_categories=collapse_categories,
     )
 
     dataloader = DataLoader(

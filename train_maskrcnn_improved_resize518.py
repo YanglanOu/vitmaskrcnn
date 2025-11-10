@@ -465,6 +465,8 @@ def main():
     parser.add_argument('--weight_decay', type=float, default=1e-4)
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--freeze_backbone', action='store_true')
+    parser.add_argument('--collapse_categories', action='store_true',
+                       help='Treat all dataset categories as a single class')
     
     # Advanced options
     parser.add_argument('--warmup_epochs', type=int, default=5)

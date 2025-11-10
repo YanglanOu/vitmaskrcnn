@@ -194,35 +194,65 @@ def visualize_predictions_vs_targets(images, predictions, targets, epoch, output
         target = targets[idx]
         
         # Determine image spatial dimensions (after cropping)
-        img_h, img_w = img_tensor.shape[1], img_tensor.shape[2]
-        img_h = int(img_h)
-        img_w = int(img_w)
+        # Use actual displayed image dimensions, not orig_size
+        img_h_actual, img_w_actual = img.shape[0], img.shape[1]
+        img_h_actual = int(img_h_actual)
+        img_w_actual = int(img_w_actual)
         
         # Create 2x2 layout: GT boxes, GT masks, Pred boxes, Pred masks
         fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(20, 20))
         
-        # Get original dimensions (for logging)
+        # Get original dimensions (for logging only)
         if 'orig_size' in target:
             orig_h, orig_w = target['orig_size'].cpu().numpy()
         else:
-            orig_h, orig_w = img_h, img_w
+            orig_h, orig_w = img_h_actual, img_w_actual
         orig_h = int(orig_h)
         orig_w = int(orig_w)
         
         # Ground truth - boxes
         ax1.imshow(img)
+        # Ensure axis limits match image dimensions for correct coordinate system
+        ax1.set_xlim(-0.5, img_w_actual - 0.5)
+        ax1.set_ylim(img_h_actual - 0.5, -0.5)
         target_boxes_norm = target['boxes'].cpu().numpy()
         
+        # Debug: Print box values before conversion
         if len(target_boxes_norm) > 0:
-            # Convert normalized boxes directly to absolute coordinates using crop dimensions
+            print(f"\n[DEBUG] Epoch {epoch}, Sample {idx}:")
+            print(f"  Image dimensions: {img_w_actual}x{img_h_actual}")
+            print(f"  Number of boxes: {len(target_boxes_norm)}")
+            print(f"  Normalized boxes (first 3): {target_boxes_norm[:3]}")
+            print(f"  Max normalized width: {target_boxes_norm[:,2].max():.4f}")
+            print(f"  Max normalized height: {target_boxes_norm[:,3].max():.4f}")
+        
+        if len(target_boxes_norm) > 0:
+            # Convert normalized boxes directly to absolute coordinates using actual displayed image dimensions
             gt_boxes = np.zeros_like(target_boxes_norm)
-            gt_boxes[:, 0] = (target_boxes_norm[:, 0] - target_boxes_norm[:, 2] / 2) * img_w
-            gt_boxes[:, 1] = (target_boxes_norm[:, 1] - target_boxes_norm[:, 3] / 2) * img_h
-            gt_boxes[:, 2] = (target_boxes_norm[:, 0] + target_boxes_norm[:, 2] / 2) * img_w
-            gt_boxes[:, 3] = (target_boxes_norm[:, 1] + target_boxes_norm[:, 3] / 2) * img_h
+            gt_boxes[:, 0] = (target_boxes_norm[:, 0] - target_boxes_norm[:, 2] / 2) * img_w_actual
+            gt_boxes[:, 1] = (target_boxes_norm[:, 1] - target_boxes_norm[:, 3] / 2) * img_h_actual
+            gt_boxes[:, 2] = (target_boxes_norm[:, 0] + target_boxes_norm[:, 2] / 2) * img_w_actual
+            gt_boxes[:, 3] = (target_boxes_norm[:, 1] + target_boxes_norm[:, 3] / 2) * img_h_actual
+            
+            # Clip to image bounds to avoid rendering artifacts
+            gt_boxes[:, [0, 2]] = np.clip(gt_boxes[:, [0, 2]], 0, img_w_actual)
+            gt_boxes[:, [1, 3]] = np.clip(gt_boxes[:, [1, 3]], 0, img_h_actual)
+            
+            # Debug: Check for suspiciously large boxes
+            box_widths = gt_boxes[:, 2] - gt_boxes[:, 0]
+            box_heights = gt_boxes[:, 3] - gt_boxes[:, 1]
+            print(f"  Absolute boxes (first 3): {gt_boxes[:3]}")
+            print(f"  Box widths (pixels, first 5): {box_widths[:5]}")
+            print(f"  Box heights (pixels, first 5): {box_heights[:5]}")
+            print(f"  Max box width: {box_widths.max():.1f} pixels ({box_widths.max()/img_w_actual*100:.1f}% of image)")
+            print(f"  Max box height: {box_heights.max():.1f} pixels ({box_heights.max()/img_h_actual*100:.1f}% of image)")
+            if box_widths.max() > img_w_actual * 0.6 or box_heights.max() > img_h_actual * 0.6:
+                print(f"  *** WARNING: Large boxes detected! Image size: {img_w_actual}x{img_h_actual}, "
+                      f"Max box: {box_widths.max():.1f}x{box_heights.max():.1f}, "
+                      f"Normalized max: w={target_boxes_norm[:,2].max():.3f}, h={target_boxes_norm[:,3].max():.3f}")
             
             ax1.set_title(
-                f'Ground Truth Boxes ({len(gt_boxes)} nuclei, crop: {img_w}x{img_h}, orig: {orig_w}x{orig_h})',
+                f'Ground Truth Boxes ({len(gt_boxes)} nuclei, crop: {img_w_actual}x{img_h_actual}, orig: {orig_w}x{orig_h})',
                 fontsize=14
             )
             for box in gt_boxes:
@@ -244,13 +274,13 @@ def visualize_predictions_vs_targets(images, predictions, targets, epoch, output
             gt_masks_tensor = torch.tensor(gt_masks, dtype=torch.float32).unsqueeze(1)  # Add channel dimension
             gt_masks_resized = F.interpolate(
                 gt_masks_tensor,
-                size=(img_h, img_w),
+                size=(img_h_actual, img_w_actual),
                 mode='bilinear',
                 align_corners=False
             ).squeeze(1).numpy()  # Remove channel dimension and convert to numpy
             
             # Combine all masks with different colors
-            combined_gt_mask = np.zeros((img_h, img_w, 3))
+            combined_gt_mask = np.zeros((img_h_actual, img_w_actual, 3))
             colors = plt.cm.Set3(np.linspace(0, 1, len(gt_masks_resized)))
             
             for i, mask in enumerate(gt_masks_resized):
@@ -287,7 +317,7 @@ def visualize_predictions_vs_targets(images, predictions, targets, epoch, output
             
             # Combine all masks with different colors
             # Use HSV color space to generate many distinct colors
-            combined_pred_mask = np.zeros((img_h, img_w, 3))
+            combined_pred_mask = np.zeros((img_h_actual, img_w_actual, 3))
             num_masks = len(pred_masks)
             
             for i, mask in enumerate(pred_masks):
@@ -470,6 +500,8 @@ def main():
                        help='Crop size (default: 224)')
     parser.add_argument('--max_crops_per_image', type=int, default=4,
                        help='Number of random crops per training image')
+    parser.add_argument('--collapse_categories', action='store_true',
+                       help='Treat all dataset categories as a single class')
     
     # Advanced options
     parser.add_argument('--warmup_epochs', type=int, default=5)
@@ -503,6 +535,7 @@ def main():
         max_crops_per_image=args.max_crops_per_image,
         train_annotations_file=os.path.join(args.data_root, "train/train_annotations.json") if os.path.exists(os.path.join(args.data_root, "train/train_annotations.json")) else None,
         val_annotations_file=os.path.join(args.data_root, "valid/val_annotations.json") if os.path.exists(os.path.join(args.data_root, "valid/val_annotations.json")) else None,
+        collapse_categories=args.collapse_categories,
     )
     
     print(f"Train batches: {len(train_loader)}")
