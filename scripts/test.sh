@@ -40,6 +40,7 @@ echo "Job ID: $SLURM_JOB_ID"
 # ---------------- Main Command ----------------
 echo "Starting testing..."
 python test_maskrcnn_improved.py \
---checkpoint "outputs_debug/run_20251104_193104/best_model.pth" \
---data_root '/dgx1data/skunkworks/pathology/bloodbytes/m341664/data/selected_148/selected_72' \
---batch_size 1
+--checkpoint "outputs/panoptils_debug/run_20251111_001656/best_model.pth" \
+--data_root '/dgx1data/skunkworks/pathology/bloodbytes/m341664/data/PanopTILs/bootstrapped_nuclei_labels/fold_1' \
+--batch_size 1 \
+--max_visualizations 50

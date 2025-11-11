@@ -97,6 +97,49 @@ def visualize_test_predictions(
         img = np.transpose(img, (1, 2, 0))
         if img.max() > 1.0:
             img = np.clip(img, 0, 1)
+        
+        # Detect black padding regions (common when image is smaller than crop_size)
+        # Black padding is typically on the right/bottom edges
+        # Find the actual image content by detecting where black regions start
+        img_h, img_w = img.shape[:2]
+        # Check if there's significant black padding (more than 10% of image)
+        # Look for vertical and horizontal black bands
+        gray = np.mean(img, axis=2) if len(img.shape) == 3 else img
+        # Check right edge for black padding
+        right_edge = gray[:, -int(img_w * 0.1):] if img_w > 10 else gray
+        left_edge = gray[:, :int(img_w * 0.1)] if img_w > 10 else gray
+        bottom_edge = gray[-int(img_h * 0.1):, :] if img_h > 10 else gray
+        top_edge = gray[:int(img_h * 0.1), :] if img_h > 10 else gray
+        
+        # If right/bottom edges are mostly black but left/top are not, it's likely padding
+        has_right_padding = np.mean(right_edge) < 0.1 and np.mean(left_edge) > 0.1
+        has_bottom_padding = np.mean(bottom_edge) < 0.1 and np.mean(top_edge) > 0.1
+        
+        # Detect actual content boundaries by finding where black padding starts
+        # Scan from edges to find where content ends
+        actual_content_w = img_w
+        actual_content_h = img_h
+        
+        if has_right_padding:
+            # Find where black padding starts on the right
+            for x in range(img_w - 1, max(0, img_w - int(img_w * 0.3)), -1):
+                column = gray[:, x]
+                if np.mean(column) > 0.1:  # Not black
+                    actual_content_w = x + 1
+                    break
+        
+        if has_bottom_padding:
+            # Find where black padding starts on the bottom
+            for y in range(img_h - 1, max(0, img_h - int(img_h * 0.3)), -1):
+                row = gray[y, :]
+                if np.mean(row) > 0.1:  # Not black
+                    actual_content_h = y + 1
+                    break
+        
+        # For visualization, we'll add a note in the title if padding is detected
+        padding_note = ""
+        if has_right_padding or has_bottom_padding:
+            padding_note = f" (black padding: content {actual_content_w}×{actual_content_h})"
 
         pred_boxes = pred["boxes"].cpu().numpy()
         pred_scores = pred["scores"].cpu().numpy()
@@ -120,12 +163,23 @@ def visualize_test_predictions(
             gt_boxes[:, 2] = (target_boxes_norm[:, 0] + target_boxes_norm[:, 2] / 2) * img_w_actual  # x2
             gt_boxes[:, 3] = (target_boxes_norm[:, 1] + target_boxes_norm[:, 3] / 2) * img_h_actual  # y2
 
+            # Filter out boxes that fall entirely in padding area
+            if has_right_padding or has_bottom_padding:
+                keep_gt = []
+                for box in gt_boxes:
+                    x1, y1, x2, y2 = box
+                    # Check if box overlaps with actual content
+                    if x2 > 0 and x1 < actual_content_w and y2 > 0 and y1 < actual_content_h:
+                        keep_gt.append(box)
+                gt_boxes = np.array(keep_gt) if keep_gt else np.zeros((0, 4))
+
             # Clip to image bounds to avoid rendering artifacts
-            gt_boxes[:, [0, 2]] = np.clip(gt_boxes[:, [0, 2]], 0, img_w_actual)
-            gt_boxes[:, [1, 3]] = np.clip(gt_boxes[:, [1, 3]], 0, img_h_actual)
+            if len(gt_boxes) > 0:
+                gt_boxes[:, [0, 2]] = np.clip(gt_boxes[:, [0, 2]], 0, img_w_actual)
+                gt_boxes[:, [1, 3]] = np.clip(gt_boxes[:, [1, 3]], 0, img_h_actual)
 
             ax1.set_title(
-                f"Ground Truth Boxes ({len(gt_boxes)} nuclei, crop: {img_w_actual}x{img_h_actual})",
+                f"Ground Truth Boxes ({len(gt_boxes)} nuclei, crop: {img_w_actual}x{img_h_actual}){padding_note}",
                 fontsize=14,
             )
             for box in gt_boxes:
@@ -135,7 +189,7 @@ def visualize_test_predictions(
                 )
                 ax1.add_patch(rect)
         else:
-            ax1.set_title("Ground Truth Boxes (0 nuclei)", fontsize=14)
+            ax1.set_title(f"Ground Truth Boxes (0 nuclei){padding_note}", fontsize=14)
         ax1.axis("off")
 
         # Ground truth masks (segmentation labels)
@@ -158,19 +212,33 @@ def visualize_test_predictions(
                 combined_gt_mask[mask > 0.5] = colors[i][:3]
 
             ax2.imshow(combined_gt_mask, alpha=0.5)
-            ax2.set_title(f"Ground Truth Masks ({len(gt_masks_resized)} masks)", fontsize=14)
+            ax2.set_title(f"Ground Truth Masks ({len(gt_masks_resized)} masks){padding_note}", fontsize=14)
         else:
-            ax2.set_title("No ground truth masks", fontsize=14)
+            ax2.set_title(f"No ground truth masks{padding_note}", fontsize=14)
         ax2.axis("off")
 
-        # Predicted boxes (filtered by threshold)
+        # Predicted boxes (filtered by threshold and padding)
         ax3.imshow(img)
         keep = pred_scores > score_threshold
         filtered_boxes = pred_boxes[keep]
         filtered_scores = pred_scores[keep]
+        
+        # Filter out boxes that fall entirely in padding area
+        if has_right_padding or has_bottom_padding:
+            boxes_in_content = []
+            scores_in_content = []
+            for box, score in zip(filtered_boxes, filtered_scores):
+                x1, y1, x2, y2 = box
+                # Check if box overlaps with actual content (not entirely in padding)
+                # Box overlaps if: x2 > 0 AND x1 < actual_content_w AND y2 > 0 AND y1 < actual_content_h
+                if x2 > 0 and x1 < actual_content_w and y2 > 0 and y1 < actual_content_h:
+                    boxes_in_content.append(box)
+                    scores_in_content.append(score)
+            filtered_boxes = np.array(boxes_in_content) if boxes_in_content else np.zeros((0, 4))
+            filtered_scores = np.array(scores_in_content) if scores_in_content else np.zeros((0,))
 
         ax3.set_title(
-            f"Predicted Boxes (>{score_threshold:.2f}, {len(filtered_boxes)} boxes)", fontsize=14
+            f"Predicted Boxes (>{score_threshold:.2f}, {len(filtered_boxes)} boxes){padding_note}", fontsize=14
         )
         for box, score in zip(filtered_boxes, filtered_scores):
             x1, y1, x2, y2 = box
@@ -193,6 +261,18 @@ def visualize_test_predictions(
         ax4.imshow(img)
         if pred_masks is not None and len(pred_masks) > 0 and keep.any():
             pred_masks_filtered = pred_masks[keep]
+            # Also filter masks that correspond to boxes in padding area
+            if has_right_padding or has_bottom_padding:
+                # filtered_boxes already has padding-filtered boxes, so we need to match masks to those boxes
+                # Get the original filtered boxes (before padding filter) to match indices
+                boxes_before_padding_filter = pred_boxes[keep]
+                masks_in_content = []
+                for i, box in enumerate(boxes_before_padding_filter):
+                    x1, y1, x2, y2 = box
+                    # Check if this box overlaps with actual content
+                    if x2 > 0 and x1 < actual_content_w and y2 > 0 and y1 < actual_content_h:
+                        masks_in_content.append(pred_masks_filtered[i])
+                pred_masks_filtered = np.array(masks_in_content) if masks_in_content else np.zeros((0, *pred_masks_filtered.shape[1:]))
             # Use actual image dimensions for mask visualization
             combined_pred_mask = np.zeros((img_h_actual, img_w_actual, 3))
             colors = plt.cm.Set3(np.linspace(0, 1, len(pred_masks_filtered)))
@@ -207,9 +287,9 @@ def visualize_test_predictions(
                 combined_pred_mask[mask_2d > 0.5] = color[:3]
 
             ax4.imshow(combined_pred_mask, alpha=0.5)
-            ax4.set_title(f"Predicted Masks ({len(pred_masks_filtered)} instances)", fontsize=14)
+            ax4.set_title(f"Predicted Masks ({len(pred_masks_filtered)} instances){padding_note}", fontsize=14)
         else:
-            ax4.set_title("Masks (none above threshold)", fontsize=14)
+            ax4.set_title(f"Masks (none above threshold){padding_note}", fontsize=14)
         ax4.axis("off")
 
         plt.tight_layout()

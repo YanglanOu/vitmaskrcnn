@@ -5,14 +5,20 @@ Supports both YOLO format (.txt) and HoverNet format (.mat/.png masks)
 import os
 import torch
 from torch.utils.data import Dataset, DataLoader
-from PIL import Image
+from PIL import Image, ImageFile
 import torchvision.transforms as T
+
+# Enable loading truncated images (some images may be corrupted)
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 import numpy as np
 import random
 import scipy.io
 from collections import defaultdict
+import json
+import mmap
+import struct
 
 try:
     from pycocotools import mask as mask_utils
@@ -37,6 +43,7 @@ class MaskRCNNCropDataset(Dataset):
         min_nuclei_per_crop: int = 1,  # Minimum nuclei required to keep a crop
         annotations_file: str = None,  # Optional: for getting original image dimensions
         collapse_categories: bool = False,
+        lazy_load_annotations: bool = None,  # Auto-detect based on file size (None = auto, True/False = override)
     ):
         self.images_dir = Path(images_dir)
         self.labels_dir = Path(labels_dir)
@@ -49,6 +56,14 @@ class MaskRCNNCropDataset(Dataset):
         self.coco_image_by_name: Dict[str, Dict] = {}
         self.coco_annotations_by_image: Dict[int, List[Dict]] = defaultdict(list)
         
+        # For lazy loading: store file handle and build index
+        self.annotations_file_path = Path(annotations_file) if annotations_file else None
+        self.annotations_file_handle = None
+        self.annotations_index: Dict[int, Tuple[int, int]] = {}  # image_id -> (start_pos, end_pos) in file
+        self.image_id_by_name: Dict[str, int] = {}  # file_name -> image_id
+        self.images_meta: Dict[int, Dict] = {}  # image_id -> image metadata
+        self.category_ids: set = set()
+        
         # Get all image files
         self.image_files = sorted(list(self.images_dir.glob('*.tif')) + 
                                  list(self.images_dir.glob('*.tiff')) +
@@ -57,37 +72,208 @@ class MaskRCNNCropDataset(Dataset):
         
         # Load annotations if provided
         self.annotations = {}
+        self._annotations_loaded = False
         if annotations_file and Path(annotations_file).exists():
-            import json
-            with open(annotations_file, 'r') as f:
-                data = json.load(f)
-                images_meta = data.get('images', [])
-                annotations_meta = data.get('annotations', [])
-
-                for img_info in images_meta:
-                    self.annotations[img_info['file_name']] = {
-                        'width': img_info['width'],
-                        'height': img_info['height']
-                    }
-                    self.coco_image_by_name[img_info['file_name']] = img_info
-
-                for ann in annotations_meta:
-                    image_id = ann.get('image_id')
-                    if image_id is not None:
-                        self.coco_annotations_by_image[image_id].append(ann)
-
-                if annotations_meta:
-                    category_ids = sorted({ann['category_id'] for ann in annotations_meta})
-                    if collapse_categories:
-                        self.category_id_to_label = {cat_id: 1 for cat_id in category_ids}
-                    else:
-                        self.category_id_to_label = {
-                            cat_id: idx + 1 for idx, cat_id in enumerate(category_ids)
-                        }
+            file_size_gb = Path(annotations_file).stat().st_size / 1e9
+            file_size_mb = file_size_gb * 1024
+            
+            # Auto-detect: use lazy loading only for files > 1GB
+            if lazy_load_annotations is None:
+                use_lazy_loading = file_size_gb > 1.0
+                if use_lazy_loading:
+                    print(f"Auto-detected: File is {file_size_gb:.2f} GB ({file_size_mb:.0f} MB) - using lazy loading")
+                else:
+                    print(f"Auto-detected: File is {file_size_mb:.0f} MB ({file_size_gb:.3f} GB) - loading directly (lazy loading not needed)")
+            else:
+                use_lazy_loading = lazy_load_annotations
+                if use_lazy_loading:
+                    print(f"Lazy loading enabled by user: File is {file_size_gb:.2f} GB ({file_size_mb:.0f} MB)")
+                else:
+                    print(f"Lazy loading disabled by user: File is {file_size_mb:.0f} MB ({file_size_gb:.3f} GB)")
+            
+            if file_size_gb > 1.0:  # Warn if file is larger than 1GB
+                print(f"WARNING: Large annotations file ({file_size_gb:.2f} GB) - consider: 1) Reducing num_workers to 0-1, 2) Using .mat/.png masks instead")
+            
+            if use_lazy_loading:
+                print(f"Deferred loading: Annotations will be loaded on first access")
+                # Don't load yet - will load on first __getitem__ call
+                self._annotations_file = annotations_file
+                self.lazy_load_annotations = True
+            else:
+                print(f"Loading annotations into memory...")
+                self._load_annotations_optimized(annotations_file)
+                self._annotations_loaded = True
+                self.lazy_load_annotations = False
+        else:
+            self.lazy_load_annotations = False
         
         print(f"Found {len(self.image_files)} images in {images_dir}")
         if train and max_crops_per_image > 1:
             print(f"Generating up to {max_crops_per_image} crops per image → ~{len(self.image_files) * max_crops_per_image} training samples")
+    
+    def _build_annotations_index(self, annotations_file: str):
+        """Build an index for lazy loading annotations - only loads metadata, not full annotations"""
+        import json
+        print("Building annotations index (this may take a while for large files)...")
+        
+        # For very large files, we'll use a streaming approach to build an index
+        # First, try to load just the images metadata (usually small)
+        try:
+            with open(annotations_file, 'r') as f:
+                # Read file in chunks to find the images section
+                # For COCO format, images come before annotations
+                data_start = f.read(1000)  # Read first 1KB to check format
+                f.seek(0)
+                
+                # Use ijson for streaming if available, otherwise fall back to full load with memory optimization
+                try:
+                    import ijson
+                    print("Using ijson for streaming JSON parsing...")
+                    
+                    # Parse images
+                    with open(annotations_file, 'rb') as f:
+                        parser = ijson.parse(f)
+                        current_key = None
+                        image_list = []
+                        ann_list = []
+                        
+                        for prefix, event, value in parser:
+                            if prefix == 'images.item' and event == 'start_map':
+                                current_image = {}
+                            elif prefix.startswith('images.item.') and event == 'string' or event == 'number':
+                                key = prefix.split('.')[-1]
+                                current_image[key] = value
+                            elif prefix == 'images.item' and event == 'end_map':
+                                image_list.append(current_image)
+                                self.image_id_by_name[current_image['file_name']] = current_image['id']
+                                self.images_meta[current_image['id']] = current_image
+                                self.annotations[current_image['file_name']] = {
+                                    'width': current_image['width'],
+                                    'height': current_image['height']
+                                }
+                                self.coco_image_by_name[current_image['file_name']] = current_image
+                            
+                            elif prefix.startswith('annotations.item.category_id') and event == 'number':
+                                self.category_ids.add(value)
+                        
+                        # For annotations, we'll load them on-demand
+                        # Store that we need to parse annotations lazily
+                        self._has_ijson = True
+                        
+                except ImportError:
+                    print("ijson not available, using optimized full load with memory cleanup...")
+                    self._has_ijson = False
+                    # Fall back to optimized full load
+                    self._load_annotations_optimized(annotations_file)
+                    return
+                
+        except Exception as e:
+            print(f"Warning: Could not build lazy index, falling back to full load: {e}")
+            self._load_annotations_optimized(annotations_file)
+        
+        # Build category mapping
+        if self.category_ids:
+            if self.collapse_categories:
+                self.category_id_to_label = {cat_id: 1 for cat_id in self.category_ids}
+            else:
+                self.category_id_to_label = {
+                    cat_id: idx + 1 for idx, cat_id in enumerate(sorted(self.category_ids))
+                }
+        
+        print(f"Index built: {len(self.images_meta)} images, {len(self.category_ids)} categories")
+        print("Annotations will be loaded on-demand per image to save memory")
+    
+    def _load_annotations_optimized(self, annotations_file: str):
+        """Optimized full load that minimizes memory overhead"""
+        import json
+        import gc
+        
+        print("Loading annotations with memory optimization...")
+        with open(annotations_file, 'r') as f:
+            data = json.load(f)
+        
+        images_meta = data.get('images', [])
+        annotations_meta = data.get('annotations', [])
+        
+        # Load image metadata (small)
+        for img_info in images_meta:
+            self.annotations[img_info['file_name']] = {
+                'width': img_info['width'],
+                'height': img_info['height']
+            }
+            self.coco_image_by_name[img_info['file_name']] = img_info
+            self.image_id_by_name[img_info['file_name']] = img_info['id']
+            self.images_meta[img_info['id']] = img_info
+        
+        # Load annotations (large - this is the memory issue)
+        # Group by image_id for faster lookup
+        for ann in annotations_meta:
+            image_id = ann.get('image_id')
+            if image_id is not None:
+                self.coco_annotations_by_image[image_id].append(ann)
+                self.category_ids.add(ann.get('category_id', 1))
+        
+        # Build category mapping
+        if self.category_ids:
+            if self.collapse_categories:
+                self.category_id_to_label = {cat_id: 1 for cat_id in self.category_ids}
+            else:
+                self.category_id_to_label = {
+                    cat_id: idx + 1 for idx, cat_id in enumerate(sorted(self.category_ids))
+                }
+        
+        # Clear large lists from memory
+        del images_meta
+        del annotations_meta
+        gc.collect()
+        
+        print(f"Loaded {len(self.coco_image_by_name)} images, {sum(len(anns) for anns in self.coco_annotations_by_image.values())} annotations")
+    
+    def _load_annotations_full(self, annotations_file: str):
+        """Original full load method (for backward compatibility)"""
+        import json
+        with open(annotations_file, 'r') as f:
+            data = json.load(f)
+            images_meta = data.get('images', [])
+            annotations_meta = data.get('annotations', [])
+
+            for img_info in images_meta:
+                self.annotations[img_info['file_name']] = {
+                    'width': img_info['width'],
+                    'height': img_info['height']
+                }
+                self.coco_image_by_name[img_info['file_name']] = img_info
+                self.image_id_by_name[img_info['file_name']] = img_info['id']
+                self.images_meta[img_info['id']] = img_info
+
+            for ann in annotations_meta:
+                image_id = ann.get('image_id')
+                if image_id is not None:
+                    self.coco_annotations_by_image[image_id].append(ann)
+                    self.category_ids.add(ann.get('category_id', 1))
+
+            if annotations_meta:
+                if self.collapse_categories:
+                    self.category_id_to_label = {cat_id: 1 for cat_id in self.category_ids}
+                else:
+                    self.category_id_to_label = {
+                        cat_id: idx + 1 for idx, cat_id in enumerate(sorted(self.category_ids))
+                    }
+    
+    def _load_annotations_for_image(self, img_path: Path) -> List[Dict]:
+        """Load annotations for a specific image on-demand"""
+        # Deferred loading: load annotations on first access if using lazy loading
+        if self.lazy_load_annotations and not self._annotations_loaded and hasattr(self, '_annotations_file'):
+            print("Loading annotations on first access (deferred loading to save memory at init)...")
+            self._load_annotations_optimized(self._annotations_file)
+            self._annotations_loaded = True
+        
+        # Return annotations for this image
+        image_info = self.coco_image_by_name.get(img_path.name)
+        if image_info:
+            image_id = image_info['id']
+            return self.coco_annotations_by_image.get(image_id, [])
+        return []
     
     def __len__(self):
         return len(self.image_files) * self.max_crops_per_image
@@ -135,22 +321,85 @@ class MaskRCNNCropDataset(Dataset):
         
         try:
             if isinstance(segmentation, dict):
-                # Check if RLE size matches image size
+                # Check if RLE counts is a list (uncompressed) or string (compressed)
+                counts = segmentation.get('counts', '')
                 rle_size = segmentation.get('size', [])
-                if len(rle_size) == 2:
-                    rle_h, rle_w = rle_size
-                    if rle_h != orig_h or rle_w != orig_w:
-                        # RLE is for different size, need to decode and resize
-                        mask = mask_utils.decode(segmentation)
-                        # Resize mask to match original image size
-                        from PIL import Image as PILImage
-                        mask_pil = PILImage.fromarray(mask)
-                        mask_pil = mask_pil.resize((orig_w, orig_h), PILImage.NEAREST)
-                        mask = np.array(mask_pil)
+                
+                # Convert uncompressed RLE (list) to binary mask
+                if isinstance(counts, list):
+                    # Uncompressed RLE format: list of run lengths
+                    # COCO RLE uses column-major (Fortran) ordering, not row-major
+                    # Runs alternate between background (0) and foreground (1), starting with background
+                    # Format: [bg_run1, fg_run1, bg_run2, fg_run2, ...]
+                    if len(rle_size) == 2:
+                        rle_h, rle_w = rle_size
+                        # Use pycocotools decode if available (handles both compressed and uncompressed)
+                        # For uncompressed RLE, pycocotools.decode() should handle it correctly
+                        if mask_utils is not None:
+                            try:
+                                # Create RLE dict in format pycocotools expects
+                                rle_dict = {
+                                    'counts': counts,
+                                    'size': [rle_h, rle_w]
+                                }
+                                # pycocotools.decode() handles uncompressed RLE (list format) correctly
+                                mask = mask_utils.decode(rle_dict)
+                            except Exception as e:
+                                # If decode fails, fall back to manual decoding with correct column-major ordering
+                                print(f"[DEBUG _decode_coco_annotation] pycocotools.decode() failed for uncompressed RLE: {e}")
+                                # Fallback: manual decoding with correct column-major ordering
+                                mask_flat = np.zeros(rle_h * rle_w, dtype=np.uint8)
+                                pos = 0
+                                for i, length in enumerate(counts):
+                                    if i % 2 == 1:  # Odd index = foreground run (1)
+                                        end = min(pos + length, rle_h * rle_w)
+                                        mask_flat[pos:end] = 1
+                                    # Move position forward (both bg and fg runs advance position)
+                                    pos += length
+                                    if pos >= rle_h * rle_w:
+                                        break
+                                # Reshape to 2D using Fortran (column-major) order for COCO RLE
+                                # This is critical: COCO RLE uses column-major ordering, not row-major
+                                mask = mask_flat.reshape(rle_h, rle_w, order='F')
+                        else:
+                            # Fallback: manual decoding with correct column-major ordering
+                            mask_flat = np.zeros(rle_h * rle_w, dtype=np.uint8)
+                            pos = 0
+                            for i, length in enumerate(counts):
+                                if i % 2 == 1:  # Odd index = foreground run (1)
+                                    end = min(pos + length, rle_h * rle_w)
+                                    mask_flat[pos:end] = 1
+                                # Move position forward (both bg and fg runs advance position)
+                                pos += length
+                                if pos >= rle_h * rle_w:
+                                    break
+                            # Reshape to 2D using Fortran (column-major) order for COCO RLE
+                            mask = mask_flat.reshape(rle_h, rle_w, order='F')
+                        
+                        # Resize if needed to match original image size
+                        if rle_h != orig_h or rle_w != orig_w:
+                            from PIL import Image as PILImage
+                            mask_pil = PILImage.fromarray(mask)
+                            mask_pil = mask_pil.resize((orig_w, orig_h), PILImage.NEAREST)
+                            mask = np.array(mask_pil)
+                    else:
+                        mask = None
+                else:
+                    # Compressed RLE (string format) - decode directly
+                    if len(rle_size) == 2:
+                        rle_h, rle_w = rle_size
+                        if rle_h != orig_h or rle_w != orig_w:
+                            # RLE is for different size, need to decode and resize
+                            mask = mask_utils.decode(segmentation)
+                            # Resize mask to match original image size
+                            from PIL import Image as PILImage
+                            mask_pil = PILImage.fromarray(mask)
+                            mask_pil = mask_pil.resize((orig_w, orig_h), PILImage.NEAREST)
+                            mask = np.array(mask_pil)
+                        else:
+                            mask = mask_utils.decode(segmentation)
                     else:
                         mask = mask_utils.decode(segmentation)
-                else:
-                    mask = mask_utils.decode(segmentation)
             else:
                 rles = mask_utils.frPyObjects(segmentation, orig_h, orig_w)
                 mask = mask_utils.decode(rles)
@@ -178,15 +427,10 @@ class MaskRCNNCropDataset(Dataset):
         masks = []
         boxes = []
         labels = []
+        
+        # Load COCO annotations for this image (lazy loaded if enabled)
+        coco_ann_list = self._load_annotations_for_image(img_path)
         image_info = self.coco_image_by_name.get(img_path.name)
-        coco_ann_list = []
-        if image_info:
-            coco_ann_list = self.coco_annotations_by_image.get(image_info['id'], [])
-        else:
-            # Debug: Check if image name doesn't match
-            if self.coco_image_by_name:
-                print(f"[DEBUG] Image {img_path.name} not found in COCO image_by_name")
-                print(f"  Available keys (first 3): {list(self.coco_image_by_name.keys())[:3]}")
         
         # Try .mat format first (HoverNet format)
         mat_path = self.labels_dir / (img_path.stem + '.mat')
@@ -294,13 +538,17 @@ class MaskRCNNCropDataset(Dataset):
                     len(boxes) == 0 or 
                     len(boxes) < len(coco_ann_list) // 2
                 )
-            print(f"[DEBUG _load_masks] Image: {img_path.name}, PNG boxes: {len(boxes)}, COCO annotations: {len(coco_ann_list)}, "
-                  f"should_use_coco: {should_use_coco}, collapse_categories: {self.collapse_categories}")
+            # Debug prints disabled to reduce log verbosity
+            # Uncomment below if debugging is needed:
+            # if self.train:
+            #     print(f"[DEBUG _load_masks] Image: {img_path.name}, PNG boxes: {len(boxes)}, COCO annotations: {len(coco_ann_list)}, "
+            #           f"should_use_coco: {should_use_coco}, collapse_categories: {self.collapse_categories}")
             if should_use_coco:
                 # Check if mask_utils is available
                 if mask_utils is None:
-                    print(f"[DEBUG _load_masks] WARNING: mask_utils (pycocotools) is not available! Cannot decode RLE masks.")
-                    print(f"[DEBUG _load_masks] Install with: pip install pycocotools")
+                    if self.train:
+                        print(f"[DEBUG _load_masks] WARNING: mask_utils (pycocotools) is not available! Cannot decode RLE masks.")
+                        print(f"[DEBUG _load_masks] Install with: pip install pycocotools")
                 
                 # Use COCO annotations instead of PNG/mask-based boxes
                 boxes = []
@@ -317,16 +565,15 @@ class MaskRCNNCropDataset(Dataset):
                         masks_decoded += 1
                     else:
                         masks_failed += 1
-                if masks_failed > 0:
+                if masks_failed > 0 and self.train:
                     print(f"[DEBUG _load_masks] COCO masks: {masks_decoded} decoded, {masks_failed} failed (will create from boxes)")
                     if mask_utils is None:
                         print(f"[DEBUG _load_masks] Reason: mask_utils is None - install pycocotools")
         else:
             # Debug: Check why COCO annotations weren't found
             if self.coco_image_by_name or self.coco_annotations_by_image:
-                print(f"[DEBUG] COCO annotations not found for {img_path.name}")
-                print(f"  Available COCO image names: {list(self.coco_image_by_name.keys())[:3]}")
-                print(f"  Looking for: {img_path.name}")
+                if self.train:  # Only print during training
+                    print(f"[DEBUG] COCO annotations not found for {img_path.name}")
 
         return boxes, labels, masks
     
@@ -353,18 +600,22 @@ class MaskRCNNCropDataset(Dataset):
             x2_crop = x2 - crop_x
             y2_crop = y2 - crop_y
             
-            # Filter boxes that overlap with crop region
-            keep = (x2_crop > 0) & (x1_crop < self.crop_size) & \
-                   (y2_crop > 0) & (y1_crop < self.crop_size)
+            # Calculate actual crop dimensions (may be smaller than crop_size if image is small)
+            actual_crop_w = min(self.crop_size, orig_w - crop_x)
+            actual_crop_h = min(self.crop_size, orig_h - crop_y)
+            
+            # Filter boxes that overlap with crop region (use actual crop dimensions, not crop_size)
+            keep = (x2_crop > 0) & (x1_crop < actual_crop_w) & \
+                   (y2_crop > 0) & (y1_crop < actual_crop_h)
             
             if keep.sum() == 0:
                 return None, torch.zeros((0, 4), dtype=torch.float32), torch.zeros((0,), dtype=torch.int64), torch.zeros((0, self.crop_size, self.crop_size), dtype=torch.float32)
             
-            # Clip to crop boundaries
-            x1_crop = torch.clamp(x1_crop[keep], 0, self.crop_size)
-            y1_crop = torch.clamp(y1_crop[keep], 0, self.crop_size)
-            x2_crop = torch.clamp(x2_crop[keep], 0, self.crop_size)
-            y2_crop = torch.clamp(y2_crop[keep], 0, self.crop_size)
+            # Clip to actual crop boundaries (not crop_size, to avoid boxes in padding)
+            x1_crop = torch.clamp(x1_crop[keep], 0, actual_crop_w)
+            y1_crop = torch.clamp(y1_crop[keep], 0, actual_crop_h)
+            x2_crop = torch.clamp(x2_crop[keep], 0, actual_crop_w)
+            y2_crop = torch.clamp(y2_crop[keep], 0, actual_crop_h)
             
             # Filter out boxes that became too small after clipping
             box_widths = x2_crop - x1_crop
@@ -423,8 +674,8 @@ class MaskRCNNCropDataset(Dataset):
                         mask_crop_np = mask_crop_np[:self.crop_size, :self.crop_size]
                         masks_cropped.append(torch.tensor(mask_crop_np, dtype=torch.float32))
                 
-                # Debug: Log mask status
-                if masks_none_count > 0:
+                # Debug: Log mask status (only during training, reduce output)
+                if masks_none_count > 0 and self.train:
                     print(f"[DEBUG _crop_and_adjust_boxes_masks] Masks: {masks_valid_count} valid, {masks_none_count} None (creating rectangles)")
             
             if len(masks_cropped) == 0:
@@ -451,6 +702,10 @@ class MaskRCNNCropDataset(Dataset):
             width=min(self.crop_size, orig_w - crop_x)
         )
         
+        # Store actual content dimensions before padding
+        actual_crop_w = image_crop.width
+        actual_crop_h = image_crop.height
+        
         # Pad if necessary (for images smaller than crop_size)
         if image_crop.size != (self.crop_size, self.crop_size):
             image_crop = T.functional.pad(
@@ -458,6 +713,36 @@ class MaskRCNNCropDataset(Dataset):
                 padding=[0, 0, self.crop_size - image_crop.width, self.crop_size - image_crop.height],
                 fill=0
             )
+            
+            # Filter out boxes that fall in the padding area
+            if len(boxes_cropped) > 0:
+                # Boxes are in normalized coordinates [cx, cy, w, h] relative to crop_size
+                # Convert to absolute to check against actual content size
+                boxes_abs = boxes_cropped.clone()
+                cx_abs = boxes_abs[:, 0] * self.crop_size
+                cy_abs = boxes_abs[:, 1] * self.crop_size
+                w_abs = boxes_abs[:, 2] * self.crop_size
+                h_abs = boxes_abs[:, 3] * self.crop_size
+                
+                # Get box boundaries
+                x1_abs = cx_abs - w_abs / 2
+                y1_abs = cy_abs - h_abs / 2
+                x2_abs = cx_abs + w_abs / 2
+                y2_abs = cy_abs + h_abs / 2
+                
+                # Keep only boxes that overlap with actual content (not entirely in padding)
+                # A box is valid if any part of it is within the actual content area
+                keep_in_content = (x2_abs > 0) & (x1_abs < actual_crop_w) & \
+                                 (y2_abs > 0) & (y1_abs < actual_crop_h)
+                
+                if keep_in_content.sum() < len(boxes_cropped):
+                    # Filter boxes and masks
+                    boxes_cropped = boxes_cropped[keep_in_content]
+                    labels_crop = labels_crop[keep_in_content]
+                    if masks_cropped.shape[0] > 0:
+                        masks_cropped = masks_cropped[keep_in_content]
+                    else:
+                        masks_cropped = torch.zeros((0, self.crop_size, self.crop_size), dtype=torch.float32)
         
         return image_crop, boxes_cropped, labels_crop, masks_cropped
     
@@ -465,10 +750,40 @@ class MaskRCNNCropDataset(Dataset):
         # Map to original image index
         original_idx = idx % len(self.image_files)
         
-        # Load image
+        # Load image with error handling for corrupted files
         img_path = self.image_files[original_idx]
-        image = Image.open(img_path).convert('RGB')
-        orig_w, orig_h = image.size
+        
+        # Check if file exists and has content
+        if not os.path.exists(img_path):
+            raise FileNotFoundError(f"Image file not found: {img_path}")
+        
+        file_size = os.path.getsize(img_path)
+        if file_size == 0:
+            # If file is empty, try next image
+            print(f"WARNING: Empty image file {img_path}, trying next image...")
+            original_idx = (original_idx + 1) % len(self.image_files)
+            img_path = self.image_files[original_idx]
+        
+        try:
+            image = Image.open(img_path).convert('RGB')
+            orig_w, orig_h = image.size
+            # Verify image is valid (has dimensions)
+            if orig_w <= 0 or orig_h <= 0:
+                raise ValueError(f"Invalid image dimensions: {orig_w}x{orig_h}")
+        except (OSError, IOError, struct.error, ValueError) as e:
+            # If image is corrupted, try next image
+            original_img_path = img_path
+            print(f"WARNING: Corrupted/invalid image file {original_img_path}: {e}, trying next image...")
+            original_idx = (original_idx + 1) % len(self.image_files)
+            img_path = self.image_files[original_idx]
+            try:
+                image = Image.open(img_path).convert('RGB')
+                orig_w, orig_h = image.size
+                if orig_w <= 0 or orig_h <= 0:
+                    raise ValueError(f"Invalid image dimensions: {orig_w}x{orig_h}")
+            except (OSError, IOError, struct.error, ValueError) as e2:
+                # If still corrupted, raise error
+                raise OSError(f"Failed to load image after retry. Original: {original_img_path}, Retry: {img_path}, Error: {e2}")
         
         # Load masks/boxes
         boxes, labels, masks_list = self._load_masks(img_path, orig_h, orig_w)
@@ -584,6 +899,7 @@ def create_dataloaders(
     train_annotations_file: str = None,
     val_annotations_file: str = None,
     collapse_categories: bool = False,
+    lazy_load_annotations: bool = None,  # Auto-detect based on file size (None = auto, True/False = override)
 ):
     """Create train and validation dataloaders"""
     
@@ -596,6 +912,7 @@ def create_dataloaders(
         min_nuclei_per_crop=1,
         annotations_file=train_annotations_file,
         collapse_categories=collapse_categories,
+        lazy_load_annotations=lazy_load_annotations,
     )
     
     val_dataset = MaskRCNNCropDataset(
@@ -607,6 +924,7 @@ def create_dataloaders(
         min_nuclei_per_crop=0,  # Allow empty crops in validation
         annotations_file=val_annotations_file,
         collapse_categories=collapse_categories,
+        lazy_load_annotations=lazy_load_annotations,
     )
     
     train_loader = DataLoader(
