@@ -127,10 +127,10 @@ class ImprovedDINOv2MaskRCNN(nn.Module):
             image_mean=[0.485, 0.456, 0.406],
             image_std=[0.229, 0.224, 0.225],
             # RPN parameters
-            rpn_pre_nms_top_n_train=4000,
-            rpn_pre_nms_top_n_test=3000,
-            rpn_post_nms_top_n_train=2000,
-            rpn_post_nms_top_n_test=1500,
+            rpn_pre_nms_top_n_train=2000,
+            rpn_pre_nms_top_n_test=1000,
+            rpn_post_nms_top_n_train=1000,
+            rpn_post_nms_top_n_test=500,
             rpn_nms_thresh=0.7,
             rpn_fg_iou_thresh=0.5,
             rpn_bg_iou_thresh=0.3,
@@ -138,7 +138,7 @@ class ImprovedDINOv2MaskRCNN(nn.Module):
             rpn_positive_fraction=0.5,
             # Box parameters
             box_score_thresh=0.01,
-            box_nms_thresh=0.3,
+            box_nms_thresh=0.4,
             box_detections_per_img=500,
             box_fg_iou_thresh=0.5,
             box_bg_iou_thresh=0.5,

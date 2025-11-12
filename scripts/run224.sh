@@ -2,7 +2,7 @@
 #SBATCH --job-name=vitg-14-maskrcnn-fb-518      # Name of the job
 #SBATCH --output=/dev/null                            # We'll redirect manually
 #SBATCH --error=/dev/null                             # We'll redirect manually
-#SBATCH --time=0-12:00:00                      # Wall time (D-HH:MM:SS) - increased to 12 hours
+#SBATCH --time=0-18:00:00                      # Wall time (D-HH:MM:SS) - increased to 12 hours
 #SBATCH --nodes=1                              # Number of nodes
 #SBATCH --gres=gpu:1                           # Number of GPUs
 #SBATCH --ntasks=1                             # Total number of tasks
@@ -65,6 +65,7 @@ python "$PROJECT_ROOT/train_maskrcnn_improved.py" \
   --data_root /dgx1data/skunkworks/pathology/bloodbytes/m341664/data/PanopTILs/bootstrapped_nuclei_labels/fold_1 \
   --freeze_backbone \
   --collapse_categories \
+  --num_epochs 100 \
   --output_dir "$OUTPUT_DIR"
 
 # Check if training was successful
